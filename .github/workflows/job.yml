@@ -1,0 +1,27 @@
+name: Run Job 3 Times a Day
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # Every day at 09:00 UTC
+    - cron: '0 12 * * *'  # Every day at 13:00 UTC
+    - cron: '0 16 * * *'  # Every day at 17:00 UTC
+  workflow_dispatch:
+
+jobs:
+  run-job:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install dependencies
+        run: pip install requests
+        
+      - name: Run job script
+        run: python job.py
