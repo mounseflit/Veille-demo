@@ -8,6 +8,8 @@ import time
 from typing import Any, Dict, List, Set, Optional, Tuple
 
 import google.generativeai as genai
+from google.generativeai.types import Tool
+from google.generativeai.types.generation_types import GenerationConfig
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, ValidationError
 
@@ -67,6 +69,9 @@ DEFAULT_MEMORY: Dict[str, Any] = {
 # URLs (veille_par_url). We introduce a file to manage email recipients.
 RECIPIENTS_FILE: str = os.getenv("RECIPIENTS_FILE", "recipients.json")
 
+# -----------------------------------------------------------------------------
+# Email configuration
+
 
 def safe_load_recipients(path: str = RECIPIENTS_FILE) -> List[str]:
     """
@@ -110,38 +115,46 @@ def atomic_save_recipients(recipients: List[str], path: str = RECIPIENTS_FILE) -
 
 def send_report_via_email(subject: str, body: str) -> None:
     """
-    Envoie le rapport par email à tous les destinataires configurés. Les
-    paramètres SMTP doivent être définis dans les variables d'environnement
-    suivantes : SMTP_SERVER, SMTP_PORT, SMTP_USER, SMTP_PASSWORD et SENDER_EMAIL
-    (facultatif, défaut SMTP_USER). Si aucun destinataire n'est configuré ou si
-    la configuration SMTP est incomplète, l'envoi est ignoré avec un message de
-    log.
+    Envoie le rapport par email à tous les destinataires configurés en utilisant
+    l'API https://mail-api-mounsef.vercel.app/api/send-email.
+    Si aucun destinataire n'est configuré, l'envoi est ignoré avec un message de log.
     """
+    if requests is None:
+        logger.error("Le module 'requests' n'est pas installé. Impossible d'envoyer l'email.")
+        return
+        
     recipients = safe_load_recipients()
     if not recipients:
         logger.info("Aucun destinataire configuré, aucun email envoyé.")
         return
-    smtp_server = os.getenv('SMTP_SERVER')
-    smtp_port = int(os.getenv('SMTP_PORT', '587'))
-    smtp_user = os.getenv('SMTP_USER')
-    smtp_password = os.getenv('SMTP_PASSWORD')
-    sender_email = os.getenv('SENDER_EMAIL', smtp_user)
-    if not smtp_server or not smtp_user or not smtp_password or not sender_email:
-        logger.warning("Configuration SMTP incomplète. Impossible d'envoyer l'email.")
-        return
+    
     try:
-        msg = EmailMessage()
-        msg['From'] = sender_email
-        msg['To'] = ', '.join(recipients)
-        msg['Subject'] = subject
-        msg.set_content(body)
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(smtp_user, smtp_password)
-            server.send_message(msg)
-        logger.info(f"Rapport envoyé à {len(recipients)} destinataires.")
+        to_email = ", ".join(recipients)
+        
+        payload = {
+            "to": to_email,
+            "cc": "",
+            "bcc": "",
+            "subject": subject,
+            "message": body,
+            "isHtml": False,
+            "attachments": []
+        }
+        
+        response = requests.post(
+            'https://mail-api-mounsef.vercel.app/api/send-email',
+            headers={'Content-Type': 'application/json'},
+            json=payload
+        )
+        
+        if response.ok:
+            logger.info(f"Rapport envoyé avec succès à {len(recipients)} destinataires.")
+        else:
+            result = response.json()
+            logger.error(f"Échec de l'envoi de l'email: {result.get('error', 'Erreur inconnue')}")
+            
     except Exception as e:
-        logger.error(f"Échec de l'envoi de l'email: {e}")
+        logger.error(f"Erreur lors de l'envoi de l'email: {e}")
 
 # -----------------------------------------------------------------------------
 # Pydantic models
@@ -318,46 +331,70 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
 
 # -----------------------------------------------------------------------------
 # Gemini helpers
+
 def call_gemini_with_retry(
-    prompt: Optional[str] = None,
-    *,
-    contents: Optional[List[Any]] = None,
+    prompt: str,
     max_retries: int = 3,
     initial_delay: int = 5,
-    model_name: str = DEFAULT_MODEL,
+    model_name: str = "gemini-2.5-flash"
 ) -> str:
+    """Call the Gemini API with retry logic and return the response text.
+
+    This helper abstracts away repeated attempts to contact the model.  It does
+    not raise on failure; instead, it logs errors and returns an empty string
+    after exhausting retries.
+
+    Args:
+        prompt: The textual prompt to send to the model.
+        max_retries: Maximum number of attempts before giving up.
+        initial_delay: Initial backoff delay (seconds) between retries.
+        model_name: Name of the Gemini model to use.
+    Returns:
+        The model's textual response, or an empty string if all attempts fail.
     """
-    Appelle le modèle Gemini avec gestion de la reconnexion. Accepte soit un
-    `prompt` (chaîne de caractères) soit `contents` (liste de messages structurés).
-    Retourne le texte de la réponse ou une chaîne vide en cas d'échec.
-    """
+
+    tools = [
+      {"url_context": {}},
+      {"google_search": {}}
+    ]
+
     model = genai.GenerativeModel(model_name=model_name)
     for attempt in range(max_retries):
         try:
-            if contents is not None:
-                # Lorsque 'contents' est fourni, passe-le explicitement en tant que
-                # paramètre nommé pour éviter les confusions avec 'prompt'.
-                response = model.generate_content(contents=contents)
-            elif prompt is not None:
-                response = model.generate_content(prompt)
-            else:
-                raise ValueError("Either `prompt` or `contents` must be provided.")
+            response = model.generate_content(
+                        contents=[
+                            {"role": "user", "content": prompt}
+                        ],
+                        generation_config=GenerationConfig(
+                            tools=tools,
+                        )
+                    )
 
-            # extraction standardisée du texte de la réponse
-            if getattr(response, "text", None):
+            # The API returns an object where `.text` holds the plain content.
+            # Fallback to candidate text if `.text` is missing.
+            if hasattr(response, "text") and response.text:
                 return response.text.strip()
+            # Some SDK versions nest the text inside `candidates[0]`.
             if getattr(response, "candidates", None):
-                cand = response.candidates[0]
-                text = getattr(cand, "text", "") or getattr(cand, "content", "")
+                candidate = response.candidates[0]
+                text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
                 if text:
                     return str(text).strip()
-            logger.warning(f"Réponse vide de Gemini (tentative {attempt+1}/{max_retries})")
+            logger.warning(
+                f"Réponse vide de Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt: {prompt}"
+            )
         except Exception as e:
-            logger.error(f"Erreur Gemini (tentative {attempt+1}/{max_retries}): {e}")
+            logger.error(
+                f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt}': {e}"
+            )
+        # If there are remaining attempts, sleep before the next try.
         if attempt < max_retries - 1:
             sleep_time = initial_delay * (2 ** attempt)
             logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
             time.sleep(sleep_time)
+    logger.error(
+        f"Toutes les tentatives ont échoué pour le prompt '{prompt}'. Retour d'une chaîne vide."
+    )
     return ""
 
 
@@ -425,81 +462,88 @@ async def perform_watch_task() -> None:
     new_urls: Set[str] = set()
     new_details: Dict[str, Any] = {}
 
-    # Step 1: Find URLs from subjects (Gemini)
-    for subject in subjects_to_watch:
-        logger.info(f"Analyse du sujet: '{subject}'")
-        prompt = (
-            f"Liste jusqu'à 5 URLs pertinentes (http/https) publiées ou mises à jour dans les dernières 24 heures "
-            f"pour ce sujet ou mot-clé : {subject}.\n"
-            "Retourne uniquement les URLs séparées par des espaces ou sauts de ligne, sans texte additionnel."
-        )
-        response_text = call_gemini_with_retry(prompt=prompt)
-        if not response_text:
-            logger.info(f"Aucune réponse pour le sujet '{subject}'.")
-            continue
-        urls = re.findall(r"https?://\S+", response_text)
-        cleaned_urls = [u.rstrip('.,);') for u in urls]
-        for url in cleaned_urls:
-            if url in seen_urls_set or url in new_urls:
-                continue
-            new_urls.add(url)
-            logger.info(f"Nouvelle URL détectée pour '{subject}': {url}")
-
-    # Step 2: Add explicit URLs from config
-    for url in urls_to_watch:
-        if url in seen_urls_set or url in new_urls:
-            logger.info(f"URL déjà connue, ignorée: '{url}'")
-            continue
-        new_urls.add(url)
-        logger.info(f"Nouvelle URL depuis la configuration: '{url}'")
-
-    # Step 3: For each newly discovered URL: SCRAPE + SUMMARIZE
+    # Step 1: Start with all URLs from configuration
+    urls_to_process = list(urls_to_watch)
+    logger.info(f"Traitement de {len(urls_to_process)} URLs depuis la configuration")
+    
+    # Step 2: Scrape each URL and check for keywords
+    keyword_matches = {}  # URL -> [matched_keywords]
+    
     # Préparer la liste des mots-clés en minuscules pour la recherche dans les pages
     keywords_lower = [kw.lower() for kw in subjects_to_watch if kw]
-    # Boucle de traitement des nouvelles URLs
-    for url in new_urls:
+    
+    # Boucle de traitement des URLs
+    for url in urls_to_process:
+        if url in seen_urls_set:
+            logger.info(f"URL déjà analysée précédemment: '{url}'")
+            continue
+            
         title, text = fetch_url_text(url)
-        # Message par défaut si le contenu n'est pas accessible
         if not text:
-            summary = (
-                "Le contenu de cette URL n'a pas pu être récupéré ou n'est pas accessible. "
-                "Aucun résumé n'a été généré."
-            )
-            contains_keyword = False
-        else:
-            # Détermine si la page contient au moins un des mots-clés suivis
-            contains_keyword = False
-            if keywords_lower:
-                text_lower = text.lower()
-                contains_keyword = any(kw in text_lower for kw in keywords_lower)
-            # Si aucun mot-clé n'est trouvé et que l'URL n'est pas une URL explicitement fournie,
-            # on peut décider de ne pas inclure la page dans le rapport. Ici nous générons
-            # néanmoins un message indiquant qu'aucun mot-clé n'a été détecté.
-            if not contains_keyword and url not in urls_to_watch and keywords_lower:
-                summary = (
-                    "Aucun des mots-clés suivis n'a été trouvé sur cette page. Aucun résumé détaillé n'a été généré."
-                )
-            else:
-                summary = summarize_with_url_context(url, text)
+            logger.info(f"Impossible de récupérer le contenu pour '{url}'")
+            continue
+        
+        # Détermine si la page contient au moins un des mots-clés suivis
+        text_lower = text.lower()
+        matched_keywords = [kw for kw in keywords_lower if kw in text_lower]
+        
+        if not matched_keywords:
+            logger.info(f"Aucun mot-clé trouvé dans '{url}', page ignorée")
+            continue
+            
+        # Si on arrive ici, on a trouvé au moins un mot-clé
+        keyword_matches[url] = matched_keywords
+        logger.info(f"URL '{url}' contient les mots-clés: {', '.join(matched_keywords)}")
+        new_urls.add(url)
 
+    # Step 3: For each URL with keywords, generate summaries focused on those keywords
+    for url, matched_keywords in keyword_matches.items():
+        title, text = fetch_url_text(url)  # Re-fetch or use cached content
+        
+        # Créer un prompt qui met l'accent sur les mots-clés trouvés
+        context_prompt = (
+            f"Analyse cette page web et résume les actualités ou informations liées spécifiquement "
+            f"aux thématiques suivantes: {', '.join(matched_keywords)}.\n\n"
+            f"CONTENU DE LA PAGE:\n{text[:15000]}"
+        )
+        
+        summary = call_gemini_with_retry(prompt=context_prompt)
+        if not summary:
+            summary = f"Mots-clés trouvés: {', '.join(matched_keywords)}. Impossible de générer un résumé détaillé."
+        
         new_details[url] = {
             "title": title or "",
-            "summary": summary or "",
-            "text": text or "",
+            "summary": summary,
+            "matched_keywords": matched_keywords,
+            "text": text[:5000] if text else "",  # Limiter la taille pour économiser l'espace
         }
-        logger.info(f"Résumé généré pour '{url}' (title='{title or 'N/A'}').")
+        logger.info(f"Résumé généré pour '{url}' avec les mots-clés {matched_keywords}")
 
-    # Step 4: Build a synthetic report of all new items
+    # Step 4: Build a synthetic report of all new items, organized by keyword
     report_text = ""
     if new_details:
-        lines = []
+        # Regrouper par mot-clé
+        keyword_to_urls = {}
         for url, info in new_details.items():
-            t = info.get("title") or ""
-            s = info.get("summary") or ""
-            lines.append(f"- {t or 'Sans titre'}\n{url}\n{s}\n")
+            for kw in info.get("matched_keywords", []):
+                if kw not in keyword_to_urls:
+                    keyword_to_urls[kw] = []
+                keyword_to_urls[kw].append(url)
+        
+        # Construire un prompt structuré par mot-clé
+        lines = ["# Rapport de veille par thématique\n"]
+        for keyword, urls in keyword_to_urls.items():
+            lines.append(f"\n## Thématique: {keyword}\n")
+            for url in urls:
+                info = new_details.get(url, {})
+                t = info.get("title") or "Sans titre"
+                s = info.get("summary") or "Pas de résumé disponible"
+                lines.append(f"- {t}\n  {url}\n  {s}\n")
+        
         report_prompt = (
-            "Rédige un rapport synthétique (en français) sur les nouveautés suivantes. "
-            "Pour chaque URL, liste 3-6 points clés, puis termine par une synthèse globale et 3 recommandations actionnables.\n\n"
+            "Rédige un rapport synthétique (en français) sur les actualités suivantes, "
+            "organisé par thématique. Pour chaque thématique, résume les points clés "
+            "et termine par une synthèse globale avec 2-3 recommandations actionnables.\n\n"
             + "\n".join(lines)
         )
         report = call_gemini_with_retry(prompt=report_prompt)
@@ -525,10 +569,16 @@ async def perform_watch_task() -> None:
             reports_list = memory.get("reports", [])
             reports_list.append(report_entry)
             memory["reports"] = reports_list
+            
+            # Envoyer le rapport par email
+            send_report_via_email(
+                subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
+                body=report_text
+            )
 
         atomic_save_memory(memory)
     else:
-        logger.info("Aucune nouvelle URL à sauvegarder.")
+        logger.info("Aucun nouveau contenu pertinent trouvé.")
     logger.info("Tâche de veille terminée.")
 
 
