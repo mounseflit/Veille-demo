@@ -354,9 +354,16 @@ def call_gemini_with_retry(
             for attempt in range(max_retries):
                 try:
                     response = model.generate_content(
-                        contents=[{"role": "user", "content": prompt}],
-                        generation_config=GenerationConfig(tools=tools),
+                        contents=[
+                            {"role": "user", "content": prompt}
+                        ],
+                        tools=tools,
+                        generation_config=GenerationConfig()
                     )
+                    # response = model.generate_content(
+                    #     contents=[{"role": "user", "content": prompt}],
+                    #     generation_config=GenerationConfig(tools=tools),
+                    # )
                     if hasattr(response, "text") and response.text:
                         return response.text.strip()
                     if getattr(response, "candidates", None):
