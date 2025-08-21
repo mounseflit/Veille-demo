@@ -5,32 +5,29 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, Dict, List, Set, Optional, Tuple
+import datetime
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-import google.generativeai as genai
-from google.generativeai.types import Tool
-from google.generativeai.types.generation_types import GenerationConfig
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:
+    BeautifulSoup = None  # type: ignore
+
 from fastapi import BackgroundTasks, FastAPI, HTTPException
-from pydantic import BaseModel, ValidationError
-
-import smtplib
-from email.message import EmailMessage
-
-# fix cors problems
 from fastapi.middleware.cors import CORSMiddleware
-
-# NEW: lightweight scraping
+from pydantic import BaseModel, ValidationError
 try:
-    import requests
+    import google.generativeai as genai  # type: ignore
+    from google.generativeai.types.generation_types import GenerationConfig  # type: ignore
 except Exception:
-    requests = None
+    # Gemini is optional. When not available, summarization will return empty strings.
+    genai = None  # type: ignore
+    GenerationConfig = None  # type: ignore
 
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    BeautifulSoup = None
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Logging configuration
 logging.basicConfig(
     level=logging.INFO,
@@ -38,70 +35,108 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -----------------------------------------------------------------------------
-# Gemini API configuration
-# try:
-#     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-# except KeyError:
-#     logger.critical(
-#         "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
-#     )
-#     raise SystemExit(
-#         "GEMINI_API_KEY non définie. Veuillez définir cette variable d'environnement et redémarrer."
-#     )
-
-# Default Gemini model
+# ---------------------------------------------------------------------------
+# Constants and configuration
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# -----------------------------------------------------------------------------
-# File paths and defaults
-SOURCES_FILE: str = os.getenv("SOURCES_FILE", "sources.json")
-MEMORY_FILE: str = os.getenv("MEMORY_FILE", "memory_db.json")
+# Configuration files
+DATA_DIR = os.getenv("WATCHER_DATA_DIR", ".")
+SOURCES_FILE: str = os.path.join(DATA_DIR, "sources.json")
+MEMORY_FILE: str = os.path.join(DATA_DIR, "memory_db.json")
+RECIPIENTS_FILE: str = os.path.join(DATA_DIR, "recipients.json")
 
 DEFAULT_MEMORY: Dict[str, Any] = {
     "seen_urls": [],
-    "details": {},  # url -> {"title": str, "summary": str, "text": str}
+    "details": {},
     "reports": [],
 }
 
-# Additional configuration files for recipients. The existing sources file
-# (SOURCES_FILE) already stores the list of keywords (keywords) and
-# URLs (veille_par_url). We introduce a file to manage email recipients.
-RECIPIENTS_FILE: str = os.getenv("RECIPIENTS_FILE", "recipients.json")
+# Memory limits
+MAX_SEEN_URLS = int(os.getenv("WATCHER_MAX_SEEN_URLS", "10000"))
+MAX_REPORTS = int(os.getenv("WATCHER_MAX_REPORTS", "100"))
 
-# -----------------------------------------------------------------------------
-# Email configuration
+# User agent for requests
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (compatible; WatcherBot/2.0; +https://example.com/bot) "
+    "PythonRequests"
+)
 
+# Concurrency lock file
+LOCK_FILE = os.path.join(DATA_DIR, ".watch_lock")
 
-def safe_load_recipients(path: str = RECIPIENTS_FILE) -> List[str]:
+# ---------------------------------------------------------------------------
+# Utility functions
+
+def normalize_url(url: str) -> str:
     """
-    Charge la liste des destinataires depuis un fichier JSON. Retourne une
-    liste vide en cas d'erreur ou si le fichier n'existe pas.
+    Normalize a URL for deduplication:
+    - Force scheme to https
+    - Lowercase the scheme and host
+    - Remove default port
+    - Strip trailing slash
+    - Drop common tracking query parameters (utm_*, gclid, ref)
+    """
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower() or "http"
+        netloc = parsed.netloc.lower()
+        # Remove default port
+        if netloc.endswith(":80"):
+            netloc = netloc[:-3]
+        if netloc.endswith(":443"):
+            netloc = netloc[:-4]
+        # Force https
+        if scheme != "https":
+            scheme = "https"
+        path = parsed.path or ""
+        # Remove trailing slash (but keep root "/")
+        if path != "/" and path.endswith("/"):
+            path = path[:-1]
+        # Clean query parameters
+        params = []
+        for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+            k = key.lower()
+            if k.startswith("utm_") or k in ("gclid", "fbclid", "ref"):
+                continue
+            params.append((key, value))
+        query = urlencode(params, doseq=True)
+        # Reassemble
+        normalized = urlunparse((scheme, netloc, path, "", query, ""))
+        return normalized
+    except Exception:
+        return url.strip()
+
+
+def safe_load_json(path: str, default: Any) -> Any:
+    """
+    Safely load JSON from a file. Returns the default if the file doesn't exist
+    or is invalid.
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, list):
-            logger.warning(f"Le fichier '{path}' ne contient pas une liste. Reset destinataires.")
-            return []
-        return [str(item).strip() for item in data if item]
+        return data
     except FileNotFoundError:
-        return []
+        return default
     except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Lecture des destinataires '{path}' impossible: {e}. Reset.")
-        return []
+        logger.error(f"Failed to load JSON from {path}: {e}. Resetting.")
+        return default
 
 
-def atomic_save_recipients(recipients: List[str], path: str = RECIPIENTS_FILE) -> None:
+def atomic_save_json(data: Any, path: str) -> None:
     """
-    Enregistre la liste des destinataires de façon atomique.
+    Save JSON to disk atomically to avoid corruption.
     """
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix=".recipients_tmp_", dir=directory, text=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp_", dir=directory, text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-            json.dump(sorted(set(recipients)), tmp_file, ensure_ascii=False, indent=2)
+            json.dump(data, tmp_file, ensure_ascii=False, indent=2)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
         os.replace(temp_path, path)
@@ -113,51 +148,363 @@ def atomic_save_recipients(recipients: List[str], path: str = RECIPIENTS_FILE) -
             pass
 
 
-def send_report_via_email(subject: str, body: str) -> None:
+def safe_load_recipients(path: str = RECIPIENTS_FILE) -> List[str]:
     """
-    Envoie le rapport par email à tous les destinataires configurés en utilisant
-    l'API https://mail-api-mounsef.vercel.app/api/send-email.
-    Si aucun destinataire n'est configuré, l'envoi est ignoré avec un message de log.
+    Load the list of recipient email addresses. Invalid entries are ignored.
     """
-    if requests is None:
-        logger.error("Le module 'requests' n'est pas installé. Impossible d'envoyer l'email.")
-        return
-        
-    recipients = safe_load_recipients()
-    if not recipients:
-        logger.info("Aucun destinataire configuré, aucun email envoyé.")
-        return
-    
-    try:
-        to_email = ", ".join(recipients)
-        
-        payload = {
-            "to": to_email,
-            "cc": "",
-            "bcc": "",
-            "subject": subject,
-            "message": body,
-            "isHtml": False,
-            "attachments": []
-        }
-        
-        response = requests.post(
-            'https://mail-api-mounsef.vercel.app/api/send-email',
-            headers={'Content-Type': 'application/json'},
-            json=payload
-        )
-        
-        if response.ok:
-            logger.info(f"Rapport envoyé avec succès à {len(recipients)} destinataires.")
-        else:
-            result = response.json()
-            logger.error(f"Échec de l'envoi de l'email: {result.get('error', 'Erreur inconnue')}")
-            
-    except Exception as e:
-        logger.error(f"Erreur lors de l'envoi de l'email: {e}")
+    data = safe_load_json(path, [])
+    recipients: List[str] = []
+    for item in data if isinstance(data, list) else []:
+        try:
+            addr = str(item).strip()
+            # Very basic email validation
+            if re.match(r"^[^@]+@[^@]+\.[^@]+$", addr):
+                recipients.append(addr)
+            else:
+                logger.warning(f"Ignoring invalid email address in recipients: {addr}")
+        except Exception:
+            continue
+    # Deduplicate
+    return sorted(set(recipients))
 
-# -----------------------------------------------------------------------------
+
+def atomic_save_recipients(recipients: List[str], path: str = RECIPIENTS_FILE) -> None:
+    """
+    Save the recipients list atomically.
+    """
+    atomic_save_json(sorted(set(recipients)), path)
+
+
+def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
+    """
+    Load the persistent memory structure safely, ensuring required keys exist.
+    """
+    data = safe_load_json(path, DEFAULT_MEMORY.copy())
+    memory: Dict[str, Any] = {
+        "seen_urls": data.get("seen_urls", []),
+        "details": data.get("details", {}),
+        "reports": data.get("reports", []),
+    }
+    # Validate types
+    if not isinstance(memory["seen_urls"], list):
+        logger.warning("'seen_urls' is not a list. Resetting.")
+        memory["seen_urls"] = []
+    if not isinstance(memory["details"], dict):
+        logger.warning("'details' is not a dict. Resetting.")
+        memory["details"] = {}
+    if not isinstance(memory["reports"], list):
+        logger.warning("'reports' is not a list. Resetting.")
+        memory["reports"] = []
+    return memory
+
+
+def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
+    """
+    Save the memory with deduplication and truncation according to limits.
+    """
+    mem_copy = dict(memory)
+    # Deduplicate and truncate seen_urls
+    seen_urls = list(dict.fromkeys(mem_copy.get("seen_urls", [])))  # preserves order
+    if len(seen_urls) > MAX_SEEN_URLS:
+        seen_urls = seen_urls[-MAX_SEEN_URLS:]
+    mem_copy["seen_urls"] = seen_urls
+    # Truncate reports
+    reports = mem_copy.get("reports", [])
+    if len(reports) > MAX_REPORTS:
+        reports = reports[-MAX_REPORTS:]
+    mem_copy["reports"] = reports
+    atomic_save_json(mem_copy, path)
+
+
+# ---------------------------------------------------------------------------
+# HTTP and scraping helpers
+
+class HTTPClient:
+    """
+    A simple HTTP client using requests.Session with retry logic.
+    """
+
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update(
+            {"User-Agent": DEFAULT_USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
+        )
+        # Configure retries
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=frozenset(["GET", "HEAD"]),
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+    def get(self, url: str, timeout: int = 10) -> Optional[str]:
+        try:
+            resp = self.session.get(url, timeout=timeout)
+            if resp.status_code >= 400:
+                logger.warning(f"HTTP {resp.status_code} for {url}")
+                return None
+            # Attempt to set correct encoding
+            if resp.encoding is None:
+                resp.encoding = resp.apparent_encoding  # type: ignore
+            return resp.text
+        except Exception as e:
+            logger.warning(f"Network error fetching {url}: {e}")
+            return None
+
+
+http_client = HTTPClient()
+
+
+def _clean_text(text: str) -> str:
+    """
+    Normalize whitespace and collapse excessive blank lines.
+    """
+    text = re.sub(r"\r", "\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
+
+
+def extract_main_text(html: str) -> Tuple[str, str]:
+    """
+    Extract title and main text from an HTML document. If BeautifulSoup is not
+    available, fall back to regex tag stripping.
+    """
+    if not html:
+        return ("", "")
+    if BeautifulSoup is None:
+        title_match = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
+        title = title_match.group(1).strip() if title_match else ""
+        # Strip scripts/styles
+        text = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
+        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
+        text = re.sub(r"<[^>]+>", " ", text)
+        return (title, _clean_text(text))
+    soup = BeautifulSoup(html, "html.parser")
+    # Remove scripts, styles, and non-content
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    for sel in ["nav", "footer", "header", "form", "aside"]:
+        for t in soup.select(sel):
+            t.decompose()
+    # Title extraction
+    title = ""
+    if soup.title and soup.title.string:
+        title = soup.title.string.strip()
+    else:
+        og = soup.find("meta", attrs={"property": "og:title"})
+        if og and og.get("content"):
+            title = og["content"].strip()  # type: ignore
+    # Attempt to find main text inside article or main tags
+    candidates = soup.select("article") or soup.select("main") or [soup.body or soup]
+    chunks: List[str] = []
+    for node in candidates:
+        text = node.get_text(separator="\n", strip=True)
+        if text:
+            chunks.append(text)
+    text = "\n\n".join(chunks) if chunks else soup.get_text(separator="\n", strip=True)
+    return (title, _clean_text(text))
+
+
+def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
+    """
+    Fetch an HTML page and extract title and main text. Returns empty strings
+    on failure.
+    """
+    html = http_client.get(url, timeout=timeout)
+    if not html:
+        return ("", "")
+    return extract_main_text(html)
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+
+def call_gemini_with_retry(
+    prompt: str,
+    max_retries: int = 3,
+    initial_delay: int = 5,
+    model_name: str = DEFAULT_MODEL,
+) -> str:
+    """
+    Call the Gemini API with retry logic and fall back to alternative API keys.
+    Returns the response text or an empty string on failure.
+    """
+    # If Gemini SDK is unavailable, return empty string
+    if genai is None or GenerationConfig is None:
+        logger.warning("google.generativeai is not installed. Skipping Gemini summarization.")
+        return ""
+    api_keys = os.environ.get("GEMINI_API_KEY", "").split(",")
+    if not api_keys or not api_keys[0]:
+        logger.error("GEMINI_API_KEY is not configured.")
+        return ""
+    last_error: Optional[Exception] = None
+    for key in api_keys:
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            genai.configure(api_key=key)
+            # attempt call with single key
+            tools: List[Dict[str, Any]] = [{"url_context": {}}, {"google_search": {}}]
+            model = genai.GenerativeModel(model_name=model_name)
+            for attempt in range(max_retries):
+                try:
+                    response = model.generate_content(
+                        contents=[{"role": "user", "content": prompt}],
+                        generation_config=GenerationConfig(tools=tools),
+                    )
+                    if hasattr(response, "text") and response.text:
+                        return response.text.strip()
+                    if getattr(response, "candidates", None):
+                        candidate = response.candidates[0]
+                        text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
+                        if text:
+                            return str(text).strip()
+                    logger.warning(
+                        f"Empty response from Gemini (attempt {attempt + 1}/{max_retries})"
+                    )
+                except Exception as e:
+                    last_error = e
+                    logger.error(
+                        f"Gemini error (attempt {attempt + 1}/{max_retries}): {e}"
+                    )
+                # Backoff
+                if attempt < max_retries - 1:
+                    sleep_time = initial_delay * (2 ** attempt)
+                    time.sleep(sleep_time)
+        except Exception as e:
+            last_error = e
+            logger.error(f"Failed to configure Gemini with provided API key: {e}")
+    if last_error:
+        logger.error(f"All Gemini calls failed. Last error: {last_error}")
+    return ""
+
+
+def summarize_with_url_context(url: str, scraped_text: str) -> str:
+    """
+    Summarize the content of a URL using Gemini. The URL is passed in the prompt
+    to give the model context. Falls back to summarizing the scraped text.
+    """
+    url_prompt = (
+        "Analyse et résume précisément en français le contenu de cette URL. "
+        "Mets en avant les mises à jour, nouvelles informations et points clés. "
+        "Structure la réponse avec des puces claires et un court paragraphe de synthèse à la fin."
+    )
+    try:
+        combined_prompt = f"{url_prompt}\n\nURL: {url}"
+        text = call_gemini_with_retry(prompt=combined_prompt)
+        if text:
+            return text
+    except Exception as e:
+        logger.info(f"URL context summarization failed for {url}: {e}")
+    if scraped_text:
+        fallback_prompt = (
+            "Voici le contenu d'une page web. Résume-le en français, en listant d'abord les points clés, "
+            "puis une synthèse courte et actionnable.\n\n"
+            f"CONTENU:\n{scraped_text[:15000]}"
+        )
+        return call_gemini_with_retry(prompt=fallback_prompt) or "Aucune description disponible pour cette URL."
+    return "Aucune description disponible pour cette URL."
+
+
+# ---------------------------------------------------------------------------
+# Search helper (optional)
+
+def perform_search(
+    keyword: str, site: str, max_results: int = 5, time_window_days: int = 1
+) -> List[Dict[str, str]]:
+    """
+    Perform a search for the given keyword on a specific site using an external
+    search API (e.g. Google Custom Search or Bing). Returns a list of results
+    with keys: title, url, snippet. If no API is configured, returns an empty list.
+
+    You can configure the search engine by setting environment variables:
+      - GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX for Google Custom Search Engine
+      - BING_API_KEY for Bing Web Search
+    The time_window_days parameter may be ignored depending on the API used.
+    """
+    results: List[Dict[str, str]] = []
+    # Google Custom Search
+    g_key = os.getenv("GOOGLE_CSE_API_KEY")
+    g_cx = os.getenv("GOOGLE_CSE_CX")
+    if g_key and g_cx:
+        try:
+            query = f"site:{site} {keyword}"
+            # restrict to last X days is not directly supported; we rely on API ranking
+            url = "https://www.googleapis.com/customsearch/v1"
+            params = {
+                "key": g_key,
+                "cx": g_cx,
+                "q": query,
+                "num": max_results,
+            }
+            resp = http_client.session.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                items = data.get("items", [])
+                for item in items:
+                    link = item.get("link")
+                    title = item.get("title")
+                    snippet = item.get("snippet")
+                    if link:
+                        results.append(
+                            {
+                                "title": title or "",
+                                "url": link,
+                                "snippet": snippet or "",
+                            }
+                        )
+                return results
+            else:
+                logger.warning(
+                    f"Google CSE API returned status {resp.status_code}: {resp.text}"
+                )
+        except Exception as e:
+            logger.warning(f"Google CSE API error: {e}")
+
+    # Bing Search (via RapidAPI or similar)
+    bing_key = os.getenv("BING_API_KEY")
+    if bing_key:
+        try:
+            query = f"site:{site} {keyword}"
+            url = "https://api.bing.microsoft.com/v7.0/search"
+            headers = {"Ocp-Apim-Subscription-Key": bing_key}
+            params = {"q": query, "count": max_results}
+            resp = http_client.session.get(url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                web_pages = data.get("webPages", {}).get("value", [])
+                for item in web_pages:
+                    link = item.get("url")
+                    title = item.get("name")
+                    snippet = item.get("snippet")
+                    if link:
+                        results.append(
+                            {
+                                "title": title or "",
+                                "url": link,
+                                "snippet": snippet or "",
+                            }
+                        )
+                return results
+            else:
+                logger.warning(
+                    f"Bing API returned status {resp.status_code}: {resp.text}"
+                )
+        except Exception as e:
+            logger.warning(f"Bing API error: {e}")
+
+    # No API configured or all failed
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Pydantic models
+
 class SourceConfig(BaseModel):
     keywords: List[str] = []
     veille_par_url: List[str] = []
@@ -171,529 +518,234 @@ class UpdateSourcesRequest(BaseModel):
     replace: Optional[SourceConfig] = None
 
 
-# Recipients management models
 class UpdateRecipientsRequest(BaseModel):
     add: Optional[List[str]] = None
     remove: Optional[List[str]] = None
     replace: Optional[List[str]] = None
 
 
-# -----------------------------------------------------------------------------
-# Memory helpers
-def safe_load_memory(path: str = MEMORY_FILE) -> Dict[str, Any]:
-    """
-    Charge le contenu du fichier mémoire en toute sécurité. Si le fichier est
-    inexistant ou mal formé, retourne une mémoire vierge.
-    """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict) or "seen_urls" not in data:
-            logger.warning(
-                f"Format de fichier mémoire invalide pour '{path}'. Réinitialisation de la mémoire."
-            )
-            return DEFAULT_MEMORY.copy()
-        memory: Dict[str, Any] = {
-            "seen_urls": data.get("seen_urls", []),
-            "details": data.get("details", {}),
-            "reports": data.get("reports", []),
-        }
-        # Validate types
-        if not isinstance(memory["seen_urls"], list):
-            logger.warning(f"'seen_urls' n'est pas une liste. Reset.")
-            return DEFAULT_MEMORY.copy()
-        if not isinstance(memory["details"], dict):
-            logger.warning(f"'details' n'est pas un objet. Reset.")
-            return DEFAULT_MEMORY.copy()
-        if not isinstance(memory["reports"], list):
-            logger.warning(f"'reports' n'est pas une liste. Reset.")
-            return DEFAULT_MEMORY.copy()
-        return memory
-    except FileNotFoundError:
-        logger.info(f"Fichier mémoire '{path}' non trouvé. Initialisation.")
-        return DEFAULT_MEMORY.copy()
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Lecture mémoire '{path}' impossible: {e}. Reset.")
-        return DEFAULT_MEMORY.copy()
+# ---------------------------------------------------------------------------
+# Core watch logic with concurrency control
 
+async def perform_watch_task() -> None:
+    """
+    Main watch task. Processes the configured keywords and URLs, fetches and
+    summarizes new content, updates the memory, and sends email reports.
 
-def atomic_save_memory(memory: Dict[str, Any], path: str = MEMORY_FILE) -> None:
+    Uses a simple file lock to prevent concurrent execution.
     """
-    Enregistre la mémoire de manière atomique pour éviter la corruption de fichier.
-    """
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    mem_copy = memory.copy()
-    mem_copy["seen_urls"] = sorted(set(mem_copy.get("seen_urls", [])))
-    fd, temp_path = tempfile.mkstemp(prefix=".memory_tmp_", dir=directory, text=True)
+    # Acquire lock
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
-            json.dump(mem_copy, tmp_file, ensure_ascii=False, indent=2)
-            tmp_file.flush()
-            os.fsync(tmp_file.fileno())
-        os.replace(temp_path, path)
-        logger.info(
-            f"Sauvegarde mémoire OK. URLs: {len(mem_copy['seen_urls'])}."
-        )
-    finally:
+        # Attempt to create lock file exclusively
+        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w") as f:
+            f.write(str(time.time()))
+    except FileExistsError:
+        # Another watch is running
+        logger.info("Watch task is already running. Skipping.")
+        return
+    except Exception as e:
+        logger.error(f"Failed to acquire watch lock: {e}")
+        return
+
+    try:
+        logger.info("Watch task started.")
+        # Load configuration
         try:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-        except OSError:
+            config_data = safe_load_json(SOURCES_FILE, {})
+            config = SourceConfig(**config_data)
+        except (ValidationError, Exception) as e:
+            logger.error(f"Invalid sources configuration: {e}. Aborting watch.")
+            return
+        keywords = config.keywords or []
+        urls_to_watch = config.veille_par_url or []
+        # Normalize URLs to watch
+        urls_to_watch = [normalize_url(u) for u in urls_to_watch if u]
+        # Load memory
+        memory = safe_load_memory()
+        seen_urls_set: Set[str] = set(memory.get("seen_urls", []))
+        new_urls: Set[str] = set()
+        new_details: Dict[str, Any] = {}
+        findings: List[Dict[str, Any]] = []
+        # Process keywords × URLs
+        for keyword in keywords:
+            if not keyword:
+                continue
+            for base_url in urls_to_watch:
+                # # Perform external search for latest results
+                # search_results = perform_search(keyword, base_url)
+                # for res in search_results:
+                #     link = normalize_url(res["url"])
+                #     if not link or link in seen_urls_set:
+                #         continue
+                #     # Fetch page text
+                #     title, text = fetch_url_text(link)
+                #     if not text:
+                #         continue
+                #     # Check if keyword appears in text (basic filter)
+                #     if keyword.lower() not in text.lower():
+                #         continue
+                #     # Summarize
+                #     summary = summarize_with_url_context(link, text)
+                #     if not summary:
+                #         continue
+                #     findings.append(
+                #         {
+                #             "keyword": keyword,
+                #             "url": link,
+                #             "title": title or res.get("title") or "Sans titre",
+                #             "summary": summary,
+                #             "source": "search",
+                #             "signal": "search",
+                #         }
+                #     )
+                # # Directly analyse base URL if not already processed
+                if base_url and base_url not in seen_urls_set:
+                    title, text = fetch_url_text(base_url)
+                    if text and keyword.lower() in text.lower():
+                        summary = summarize_with_url_context(base_url, text)
+                        findings.append(
+                            {
+                                "keyword": keyword,
+                                "url": base_url,
+                                "title": title or "Sans titre",
+                                "summary": summary,
+                                "source": "direct_url",
+                                "signal": "direct_url",
+                            }
+                        )
+        # Filter out duplicates and seen URLs
+        unique_findings: List[Dict[str, Any]] = []
+        for item in findings:
+            url = item["url"]
+            if url not in seen_urls_set:
+                unique_findings.append(item)
+                new_urls.add(url)
+                new_details[url] = {
+                    "title": item["title"],
+                    "summary": item["summary"],
+                    "matched_keywords": [item["keyword"]],
+                    "source": item["source"],
+                    "signal": item["signal"],
+                }
+                seen_urls_set.add(url)
+        # Build report
+        report_text = ""
+        if unique_findings:
+            # Group by keyword
+            keyword_to_items: Dict[str, List[Dict[str, Any]]] = {}
+            for item in unique_findings:
+                kw = item["keyword"]
+                keyword_to_items.setdefault(kw, []).append(item)
+            lines = ["# Rapport de veille par thématique\n"]
+            for kw, items in keyword_to_items.items():
+                lines.append(f"\n## Thématique: {kw}\n")
+                for it in items:
+                    t = it.get("title") or "Sans titre"
+                    u = it.get("url")
+                    s = it.get("summary") or "Pas de résumé disponible"
+                    src = it.get("source")
+                    sig = it.get("signal")
+                    lines.append(
+                        f"- {t}\n  {u}\n  Source: {src}\n  Signal: {sig}\n  {s}\n"
+                    )
+            report_prompt = (
+                "Rédige un rapport synthétique (en français) sur les actualités suivantes, "
+                "organisé par thématique. Pour chaque thématique, résume les points clés "
+                "et termine par une synthèse globale avec 2-3 recommandations actionnables.\n\n"
+                + "\n".join(lines)
+            )
+            generated_report = call_gemini_with_retry(prompt=report_prompt)
+            report_text = generated_report or "\n".join(lines)
+        # Persist memory and send report
+        if new_urls:
+            memory["seen_urls"] = list(seen_urls_set)
+            memory_details = memory.get("details", {})
+            memory_details.update(new_details)
+            memory["details"] = memory_details
+            if report_text:
+                report_entry = {
+                    "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+                    "new_urls": sorted(new_urls),
+                    "report": report_text,
+                }
+                memory_reports = memory.get("reports", [])
+                memory_reports.append(report_entry)
+                memory["reports"] = memory_reports
+                # Send email
+                send_report_via_email(
+                    subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
+                    body=report_text,
+                )
+            # Save memory
+            atomic_save_memory(memory)
+        else:
+            logger.info("No new relevant content found.")
+        logger.info("Watch task completed.")
+    finally:
+        # Release lock
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.remove(LOCK_FILE)
+        except Exception:
             pass
 
 
-# -----------------------------------------------------------------------------
-# Scraping helpers (NEW)
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; WatcherBot/1.0; +https://example.com/bot) "
-    "PythonRequests"
-)
+# ---------------------------------------------------------------------------
+# Email sending
 
-
-def _clean_text(text: str) -> str:
+def send_report_via_email(subject: str, body: str) -> None:
     """
-    Normalise les espaces et supprime les lignes vides en excès.
+    Send the report via email to all configured recipients using an external
+    mail API. If no recipients are configured or requests is unavailable, the
+    send is skipped.
     """
-    text = re.sub(r"\r", "\n", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-    return text.strip()
-
-
-def extract_main_text(html: str) -> Tuple[str, str]:
-    """
-    Extrait le titre et le texte principal d'un document HTML. Utilise BeautifulSoup
-    si disponible, sinon effectue un décapage basique des balises.
-    """
-    if not html:
-        return ("", "")
-    if BeautifulSoup is None:
-        # fallback: strip tags crudely
-        title_match = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
-        title = title_match.group(1).strip() if title_match else ""
-        # remove tags
-        text = re.sub(r"<script.*?</script>", " ", html, flags=re.I | re.S)
-        text = re.sub(r"<style.*?</style>", " ", text, flags=re.I | re.S)
-        text = re.sub(r"<[^>]+>", " ", text)
-        return (title, _clean_text(text))
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # remove scripts/styles and common non-content containers
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    for sel in ["nav", "footer", "header", "form", "aside"]:
-        for t in soup.select(sel):
-            t.decompose()
-
-    title = ""
-    if soup.title and soup.title.string:
-        title = soup.title.string.strip()
-    else:
-        og = soup.find("meta", attrs={"property": "og:title"})
-        if og and og.get("content"):
-            title = og["content"].strip()
-
-    candidates = soup.select("article") or soup.select("main") or [soup.body or soup]
-    chunks: List[str] = []
-    for node in candidates:
-        text = node.get_text(separator="\n", strip=True)
-        if text:
-            chunks.append(text)
-    text = "\n\n".join(chunks) if chunks else soup.get_text(separator="\n", strip=True)
-    return (title, _clean_text(text))
-
-
-def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
-    """
-    Tente de récupérer le contenu HTML d'une URL et d'en extraire le titre et le
-    texte principal. En cas d'échec, retourne des chaînes vides.
-    """
-    if requests is None:
-        logger.warning("Le module 'requests' n'est pas installé. Impossible de scraper.")
-        return ("", "")
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
-            timeout=timeout,
-        )
-        if resp.status_code >= 400:
-            logger.warning(f"Échec HTTP {resp.status_code} pour {url}")
-            return ("", "")
-        html = resp.text
-        return extract_main_text(html)
-    except Exception as e:
-        logger.warning(f"Erreur réseau pour {url}: {e}")
-        return ("", "")
-
-
-# -----------------------------------------------------------------------------
-# Gemini helpers
-
-# def call_gemini_with_retry(
-#     prompt: str,
-#     max_retries: int = 3,
-#     initial_delay: int = 5,
-#     model_name: str = "gemini-2.5-flash"
-# ) -> str:
-#     """Call the Gemini API with retry logic and return the response text.
-
-#     This helper abstracts away repeated attempts to contact the model.  It does
-#     not raise on failure; instead, it logs errors and returns an empty string
-#     after exhausting retries.
-
-#     Args:
-#         prompt: The textual prompt to send to the model.
-#         max_retries: Maximum number of attempts before giving up.
-#         initial_delay: Initial backoff delay (seconds) between retries.
-#         model_name: Name of the Gemini model to use.
-#     Returns:
-#         The model's textual response, or an empty string if all attempts fail.
-#     """
-
-#     tools = [
-#       {"url_context": {}},
-#       {"google_search": {}}
-#     ]
-
-#     model = genai.GenerativeModel(model_name=model_name)
-#     for attempt in range(max_retries):
-#         try:
-#             response = model.generate_content(
-#                         contents=[
-#                             {"role": "user", "content": prompt}
-#                         ],
-#                         generation_config=GenerationConfig(
-#                             tools=tools,
-#                         )
-#                     )
-
-#             # The API returns an object where `.text` holds the plain content.
-#             # Fallback to candidate text if `.text` is missing.
-#             if hasattr(response, "text") and response.text:
-#                 return response.text.strip()
-#             # Some SDK versions nest the text inside `candidates[0]`.
-#             if getattr(response, "candidates", None):
-#                 candidate = response.candidates[0]
-#                 text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
-#                 if text:
-#                     return str(text).strip()
-#             logger.warning(
-#                 f"Réponse vide de Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt: {prompt}"
-#             )
-#         except Exception as e:
-#             logger.error(
-#                 f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt}': {e}"
-#             )
-#         # If there are remaining attempts, sleep before the next try.
-#         if attempt < max_retries - 1:
-#             sleep_time = initial_delay * (2 ** attempt)
-#             logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
-#             time.sleep(sleep_time)
-#     logger.error(
-#         f"Toutes les tentatives ont échoué pour le prompt '{prompt}'. Retour d'une chaîne vide."
-#     )
-#     return ""
-
-
-# call with fallback to other API keys
-def call_gemini_with_retry(
-    prompt: str,
-    max_retries: int = 3,
-    initial_delay: int = 5,
-    model_name: str = DEFAULT_MODEL
-) -> str:
-    """Call the Gemini API with retry logic and fallback to alternative API keys.
-
-    This helper abstracts away repeated attempts to contact the model. It does
-    not raise on failure; instead, it logs errors and returns an empty string
-    after exhausting retries. It also attempts to use alternative API keys if configured.
-
-    Args:
-        prompt: The textual prompt to send to the model.
-        max_retries: Maximum number of attempts before giving up.
-        initial_delay: Initial backoff delay (seconds) between retries.
-        model_name: Name of the Gemini model to use.
-    Returns:
-        The model's textual response, or an empty string if all attempts fail.
-    """
-    # Try alternative API keys if main one fails
-    # Format: "key1,key2,key3"
-    api_keys = os.environ.get("GEMINI_API_KEY", "").split(",")
-    if len(api_keys) <= 1:
-        return _call_gemini_single_key(prompt, max_retries, initial_delay, model_name)
-    
-    # We have multiple keys - try each one
-    logger.info(f"Found {len(api_keys)} API keys to try")
-    last_error = None
-    for i, api_key in enumerate(api_keys):
-        if not api_key.strip():
-            continue
-            
-        try:
-            # Configure with this specific key
-            genai.configure(api_key=api_key.strip())
-            result = _call_gemini_single_key(prompt, max_retries, initial_delay, model_name)
-            if result:  # If we got a valid response, return it
-                return result
-        except Exception as e:
-            last_error = e
-            logger.warning(f"API key {i+1} failed: {e}")
-    
-    # All keys failed
-    if last_error:
-        logger.error(f"All API keys failed. Last error: {last_error}")
-    return ""
-
-def _call_gemini_single_key(
-    prompt: str,
-    max_retries: int = 3,
-    initial_delay: int = 5,
-    model_name: str = DEFAULT_MODEL
-) -> str:
-    """Internal helper to call Gemini with a single configured API key"""
-    tools = [
-      {"url_context": {}},
-      {"google_search": {}}
-    ]
-
-    model = genai.GenerativeModel(model_name=model_name)
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(
-                        contents=[
-                            {"role": "user", "content": prompt}
-                        ],
-                        generation_config=GenerationConfig(
-                            tools=tools,
-                        )
-                    )
-
-            # The API returns an object where `.text` holds the plain content.
-            # Fallback to candidate text if `.text` is missing.
-            if hasattr(response, "text") and response.text:
-                return response.text.strip()
-            # Some SDK versions nest the text inside `candidates[0]`.
-            if getattr(response, "candidates", None):
-                candidate = response.candidates[0]
-                text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
-                if text:
-                    return str(text).strip()
-            logger.warning(
-                f"Réponse vide de Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt: {prompt}"
-            )
-        except Exception as e:
-            logger.error(
-                f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt[:50]}...': {e}"
-            )
-        # If there are remaining attempts, sleep before the next try.
-        if attempt < max_retries - 1:
-            sleep_time = initial_delay * (2 ** attempt)
-            logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
-            time.sleep(sleep_time)
-    return ""
-
-
-def summarize_with_url_context(url: str, scraped_text: str) -> str:
-    """
-    Tente d'analyser et de résumer le contenu d'une URL. Si l'utilisation du
-    contexte URL n'est pas disponible, s'appuie sur le texte scrappé. Cette
-    fonction n'utilise pas de 'url' part direct, car le SDK ne reconnaît pas un
-    dictionnaire avec la clé 'url' seule【649065952783530†L207-L260】. À la place,
-    on fournit l'URL comme simple texte dans le prompt. En cas d'échec ou si
-    aucun texte n'est disponible, retourne un message par défaut.
-    """
-    # 1) Prompt pour demander un résumé en mentionnant l'URL. On évite d'utiliser
-    # un 'url' part non pris en charge par le SDK.
-    url_prompt = (
-        "Analyse et résume précisément en français le contenu de cette URL. "
-        "Mets en avant les mises à jour, nouvelles informations et points clés. "
-        "Structure la réponse avec des puces claires et un court paragraphe de synthèse à la fin."
-    )
-
-    # On construit un prompt textuel qui inclut explicitement l'URL. Le modèle
-    # pourra utiliser ses connaissances ou échouer silencieusement si la
-    # récupération n'est pas possible.
-    try:
-        combined_prompt = f"{url_prompt}\n\nURL: {url}"
-        text = call_gemini_with_retry(prompt=combined_prompt)
-        if text:
-            return text
-    except Exception as e:
-        logger.info(f"Contexte URL non disponible ou a échoué pour {url}: {e}")
-
-    # 2) Fallback: si nous disposons du texte scrappé, résume-le.
-    if scraped_text:
-        fallback_prompt = (
-            "Voici le contenu d'une page web. Résume-le en français, en listant d'abord les points clés, "
-            "puis une synthèse courte et actionnable.\n\n"
-            f"CONTENU:\n{scraped_text[:15000]}"
-        )
-        return call_gemini_with_retry(prompt=fallback_prompt) or "Aucune description disponible pour cette URL."
-    # 3) Dernier recours
-    return "Aucune description disponible pour cette URL."
-
-
-# -----------------------------------------------------------------------------
-# Veille logic
-async def perform_watch_task() -> None:
-    logger.info("Tâche de veille démarrée.")
-    try:
-        with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-            config_data = json.load(f)
-        config = SourceConfig(**config_data)
-    except FileNotFoundError:
-        logger.error(f"Fichier de configuration '{SOURCES_FILE}' introuvable. Veille annulée.")
+    recipients = safe_load_recipients()
+    if not recipients:
+        logger.info("No recipients configured. Skipping email.")
         return
-    except (json.JSONDecodeError, ValidationError) as e:
-        logger.error(f"Config '{SOURCES_FILE}' invalide: {e}. Veille annulée.")
-        return
-
-    subjects_to_watch = config.keywords
-    urls_to_watch = config.veille_par_url
-
-    memory = safe_load_memory()
-    seen_urls_set: Set[str] = set(memory.get("seen_urls", []))
-    details: Dict[str, Any] = memory.get("details", {})
-    new_urls: Set[str] = set()
-    new_details: Dict[str, Any] = {}
-
-    # Step 1: For each keyword and each URL, do research and analysis
-    findings = []  # List of dicts: {"keyword", "url", "title", "summary", "source", "signal"}
-    for keyword in subjects_to_watch:
-        keyword_lower = keyword.lower()
-        for url in urls_to_watch:
-            # 1. Google Search for latest results (site:url keyword, last 24h)
-            search_prompt = (
-                f"Effectue une recherche Google sur le site '{url}' pour le mot-clé '{keyword}' "
-                f"et ne retiens que les résultats des dernières 24h. Pour chaque résultat, analyse le contenu et indique s'il y a un signal pertinent pour le mot-clé. "
-                f"Donne le titre, l'URL, un résumé et précise la nature du signal (nouveauté, tendance, alerte, etc)."
-            )
-            search_results = call_gemini_with_retry(prompt=search_prompt)
-
-            # 2. Analyse directe de l'URL pour le mot-clé
-            title, text = fetch_url_text(url)
-            if text:
-                direct_prompt = (
-                    f"Analyse le contenu de cette page web pour le mot-clé '{keyword}'. "
-                    f"Indique s'il y a un signal important ou une actualité pertinente. Résume uniquement si le mot-clé est présent et pertinent.\n\n"
-                    f"CONTENU DE LA PAGE:\n{text[:15000]}"
-                )
-                direct_result = call_gemini_with_retry(prompt=direct_prompt)
-            else:
-                direct_result = ""
-
-            # 3. Parse and collect findings from both sources
-            # For Google Search results, try to extract items (simulate parsing)
-            if search_results:
-                # Assume Gemini returns a list of items in markdown or bullet format
-                for line in search_results.splitlines():
-                    if "http" in line:
-                        # Try to extract URL
-                        url_match = re.search(r'(https?://\S+)', line)
-                        found_url = url_match.group(1) if url_match else None
-                        if found_url and found_url not in seen_urls_set:
-                            findings.append({
-                                "keyword": keyword,
-                                "url": found_url,
-                                "title": title,
-                                "summary": line.strip(),
-                                "source": "google_search",
-                                "signal": "google_search"
-                            })
-            # For direct analysis, only add if signal and not duplicate
-            if direct_result and keyword_lower in text.lower() and url not in seen_urls_set:
-                findings.append({
-                    "keyword": keyword,
-                    "url": url,
-                    "title": title,
-                    "summary": direct_result.strip(),
-                    "source": "direct_url",
-                    "signal": "direct_url"
-                })
-
-    # Step 2: Filter out duplicates and already seen URLs
-    unique_findings = []
-    for item in findings:
-        if item["url"] not in seen_urls_set:
-            unique_findings.append(item)
-            new_urls.add(item["url"])
-            new_details[item["url"]] = {
-                "title": item["title"] or "",
-                "summary": item["summary"],
-                "matched_keywords": [item["keyword"]],
-                "source": item["source"],
-                "signal": item["signal"]
-            }
-
-    # Step 3: Build a synthetic report grouped by keyword
-    report_text = ""
-    if unique_findings:
-        keyword_to_items = {}
-        for item in unique_findings:
-            kw = item["keyword"]
-            if kw not in keyword_to_items:
-                keyword_to_items[kw] = []
-            keyword_to_items[kw].append(item)
-        lines = ["# Rapport de veille par thématique\n"]
-        for keyword, items in keyword_to_items.items():
-            lines.append(f"\n## Thématique: {keyword}\n")
-            for item in items:
-                t = item.get("title") or "Sans titre"
-                u = item.get("url")
-                s = item.get("summary") or "Pas de résumé disponible"
-                src = item.get("source")
-                sig = item.get("signal")
-                lines.append(f"- {t}\n  {u}\n  Source: {src}\n  Signal: {sig}\n  {s}\n")
-        report_prompt = (
-            "Rédige un rapport synthétique (en français) sur les actualités suivantes, "
-            "organisé par thématique. Pour chaque thématique, résume les points clés "
-            "et termine par une synthèse globale avec 2-3 recommandations actionnables.\n\n"
-            + "\n".join(lines)
+    # Compose payload
+    to_email = ", ".join(recipients)
+    payload = {
+        "to": to_email,
+        "cc": "",
+        "bcc": "",
+        "subject": subject,
+        "message": body,
+        "isHtml": False,
+        "attachments": [],
+    }
+    try:
+        response = http_client.session.post(
+            "https://mail-api-mounsef.vercel.app/api/send-email",
+            json=payload,
+            timeout=15,
         )
-        report = call_gemini_with_retry(prompt=report_prompt)
-        report_text = report or "\n".join(lines)
-
-    # Step 4: Persist
-    if new_urls:
-        memory_seen = set(memory.get("seen_urls", []))
-        memory_seen.update(new_urls)
-        memory["seen_urls"] = list(memory_seen)
-
-        merged_details = memory.get("details", {})
-        merged_details.update(new_details)
-        memory["details"] = merged_details
-
-        if report_text:
-            import datetime
-            report_entry = {
-                "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-                "new_urls": list(new_urls),
-                "report": report_text,
-            }
-            reports_list = memory.get("reports", [])
-            reports_list.append(report_entry)
-            memory["reports"] = reports_list
-            send_report_via_email(
-                subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
-                body=report_text
-            )
-
-        atomic_save_memory(memory)
-    else:
-        logger.info("Aucun nouveau contenu pertinent trouvé.")
-    logger.info("Tâche de veille terminée.")
+        if response.ok:
+            logger.info(f"Report email successfully sent to {len(recipients)} recipients.")
+        else:
+            try:
+                res_json = response.json()
+                err = res_json.get("error", "Unknown error")
+            except Exception:
+                err = response.text
+            logger.error(f"Failed to send email: {err}")
+    except Exception as e:
+        logger.error(f"Error sending email: {e}")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # FastAPI app
+
 app = FastAPI(
-    title="Watcher API v2 (with Scraping & URL Context)",
-    description="API de veille stratégique avec scraping basique et contexte URL pour Gemini.",
+    title="Watcher API v3",
+    description=(
+        "API de veille stratégique améliorée avec scraping, recherche externe facultative "
+        "et contexte URL pour Gemini. La mémoire est bornée et la concurrence contrôlée."
+    ),
 )
 
+# Enable open CORS as requested. In production you should restrict origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -705,15 +757,21 @@ app.add_middleware(
 
 @app.post("/watch", summary="Déclenche la veille en tâche de fond")
 async def trigger_watch_endpoint(background_tasks: BackgroundTasks) -> Dict[str, str]:
+    """
+    Launch the watch task asynchronously. If a watch is already running, it will
+    skip launching another instance.
+    """
     background_tasks.add_task(perform_watch_task)
-    logger.info("Requête de veille reçue. Tâche programmée en arrière-plan.")
-    return {
-        "message": "La veille a été lancée en arrière-plan. Consultez les logs pour les détails."
-    }
+    logger.info("Watch request received. Task scheduled in background.")
+    return {"message": "La veille a été lancée en arrière-plan. Consultez les logs pour les détails."}
 
 
 @app.get("/memory", summary="Affiche la mémoire complète")
 async def get_memory_content() -> Dict[str, Any]:
+    """
+    Return the entire memory content. Use with caution as this may include a large
+    number of entries.
+    """
     return safe_load_memory()
 
 
@@ -722,32 +780,30 @@ async def root() -> Dict[str, str]:
     return {"status": "ok", "message": "Watcher API is operational."}
 
 
-# Sources management
 @app.get("/sources", summary="Lire la configuration des sources")
 async def read_sources() -> Dict[str, Any]:
+    """
+    Read the current sources configuration.
+    """
+    data = safe_load_json(SOURCES_FILE, {})
     try:
-        with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
         config = SourceConfig(**data)
         return config.dict()
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Le fichier '{SOURCES_FILE}' est introuvable.")
-    except (json.JSONDecodeError, ValidationError) as e:
-        raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
+    except (ValidationError, Exception) as e:
+        raise HTTPException(status_code=500, detail=f"Invalid sources configuration: {e}")
 
 
 @app.post("/sources", summary="Modifier la configuration des sources")
 async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
+    """
+    Update the sources configuration. Supports adding/removing keywords and URLs,
+    or replacing the entire configuration.
+    """
+    current_data = safe_load_json(SOURCES_FILE, {})
     try:
-        if os.path.exists(SOURCES_FILE):
-            with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-                current_data = json.load(f)
-            current_config = SourceConfig(**current_data)
-        else:
-            current_config = SourceConfig()
-    except (json.JSONDecodeError, ValidationError) as e:
-        raise HTTPException(status_code=500, detail=f"Le fichier '{SOURCES_FILE}' est invalide: {e}")
-
+        current_config = SourceConfig(**current_data)
+    except (ValidationError, Exception):
+        current_config = SourceConfig()
     if update.replace is not None:
         new_config = update.replace
     else:
@@ -757,45 +813,48 @@ async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
         )
         if update.add_subjects:
             for subj in update.add_subjects:
-                if subj not in new_config.keywords:
+                if subj and subj not in new_config.keywords:
                     new_config.keywords.append(subj)
         if update.add_urls:
             for url in update.add_urls:
-                if url not in new_config.veille_par_url:
-                    new_config.veille_par_url.append(url)
+                nurl = normalize_url(url)
+                if nurl and nurl not in new_config.veille_par_url:
+                    new_config.veille_par_url.append(nurl)
         if update.remove_subjects:
-            new_config.keywords = [s for s in new_config.keywords if s not in update.remove_subjects]
+            new_config.keywords = [s for s in new_config.keywords if s not in (update.remove_subjects or [])]
         if update.remove_urls:
-            new_config.veille_par_url = [u for u in new_config.veille_par_url if u not in update.remove_urls]
-
+            to_remove = {normalize_url(u) for u in update.remove_urls}
+            new_config.veille_par_url = [u for u in new_config.veille_par_url if u not in to_remove]
+    # Save
     try:
-        with open(SOURCES_FILE, "w", encoding="utf-8") as f:
-            json.dump(new_config.dict(), f, ensure_ascii=False, indent=2)
-    except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Erreur lors de l'écriture de '{SOURCES_FILE}': {e}")
+        atomic_save_json(new_config.dict(), SOURCES_FILE)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error writing sources: {e}")
     return new_config.dict()
 
 
-# Details & reports
 @app.get("/details", summary="Consulter les descriptions enregistrées")
 async def get_details() -> Dict[str, Any]:
+    """
+    Return the stored details for all seen URLs.
+    """
     memory = safe_load_memory()
     return memory.get("details", {})
 
 
 @app.get("/reports", summary="Consulter l'historique des rapports générés")
 async def get_reports() -> List[Dict[str, Any]]:
+    """
+    Return the list of generated reports.
+    """
     memory = safe_load_memory()
     return memory.get("reports", [])
 
-# -----------------------------------------------------------------------------
-# Recipients management
 
 @app.get("/recipients", summary="Obtenir la liste des destinataires")
 async def get_recipients() -> List[str]:
     """
-    Retourne la liste actuelle des adresses électroniques des destinataires. Si
-    aucun destinataire n'est configuré, retourne une liste vide.
+    Return the current list of email recipients.
     """
     return safe_load_recipients()
 
@@ -803,19 +862,26 @@ async def get_recipients() -> List[str]:
 @app.post("/recipients", summary="Modifier la liste des destinataires")
 async def update_recipients(update: UpdateRecipientsRequest) -> List[str]:
     """
-    Ajoute, supprime ou remplace la liste des destinataires. Les adresses sont
-    dédupliquées et sauvegardées.
+    Update the list of email recipients. Supports adding, removing, or replacing.
     """
     current = safe_load_recipients()
     if update.replace is not None:
         new_list = [str(addr).strip() for addr in (update.replace or []) if addr]
+        # Validate emails
+        new_valid: List[str] = []
+        for addr in new_list:
+            if re.match(r"^[^@]+@[^@]+\.[^@]+$", addr):
+                new_valid.append(addr)
+            else:
+                logger.warning(f"Ignoring invalid email address: {addr}")
+        new_list = new_valid
     else:
         new_list = list(current)
         if update.add:
             for addr in update.add:
-                if addr and addr not in new_list:
-                    new_list.append(addr)
+                if addr and addr not in new_list and re.match(r"^[^@]+@[^@]+\.[^@]+$", addr):
+                    new_list.append(addr.strip())
         if update.remove:
-            new_list = [addr for addr in new_list if addr not in update.remove]
+            new_list = [addr for addr in new_list if addr not in (update.remove or [])]
     atomic_save_recipients(new_list)
-    return new_list
+    return sorted(set(new_list))
