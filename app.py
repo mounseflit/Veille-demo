@@ -40,18 +40,18 @@ logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Gemini API configuration
-try:
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-except KeyError:
-    logger.critical(
-        "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
-    )
-    raise SystemExit(
-        "GEMINI_API_KEY non définie. Veuillez définir cette variable d'environnement et redémarrer."
-    )
+# try:
+#     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+# except KeyError:
+#     logger.critical(
+#         "Erreur critique: la variable d'environnement GEMINI_API_KEY n'est pas définie."
+#     )
+#     raise SystemExit(
+#         "GEMINI_API_KEY non définie. Veuillez définir cette variable d'environnement et redémarrer."
+#     )
 
 # Default Gemini model
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 # -----------------------------------------------------------------------------
 # File paths and defaults
@@ -65,7 +65,7 @@ DEFAULT_MEMORY: Dict[str, Any] = {
 }
 
 # Additional configuration files for recipients. The existing sources file
-# (SOURCES_FILE) already stores the list of keywords (veille_par_sujet) and
+# (SOURCES_FILE) already stores the list of keywords (keywords) and
 # URLs (veille_par_url). We introduce a file to manage email recipients.
 RECIPIENTS_FILE: str = os.getenv("RECIPIENTS_FILE", "recipients.json")
 
@@ -159,7 +159,7 @@ def send_report_via_email(subject: str, body: str) -> None:
 # -----------------------------------------------------------------------------
 # Pydantic models
 class SourceConfig(BaseModel):
-    veille_par_sujet: List[str] = []
+    keywords: List[str] = []
     veille_par_url: List[str] = []
 
 
@@ -332,17 +332,84 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
 # -----------------------------------------------------------------------------
 # Gemini helpers
 
+# def call_gemini_with_retry(
+#     prompt: str,
+#     max_retries: int = 3,
+#     initial_delay: int = 5,
+#     model_name: str = "gemini-2.5-flash"
+# ) -> str:
+#     """Call the Gemini API with retry logic and return the response text.
+
+#     This helper abstracts away repeated attempts to contact the model.  It does
+#     not raise on failure; instead, it logs errors and returns an empty string
+#     after exhausting retries.
+
+#     Args:
+#         prompt: The textual prompt to send to the model.
+#         max_retries: Maximum number of attempts before giving up.
+#         initial_delay: Initial backoff delay (seconds) between retries.
+#         model_name: Name of the Gemini model to use.
+#     Returns:
+#         The model's textual response, or an empty string if all attempts fail.
+#     """
+
+#     tools = [
+#       {"url_context": {}},
+#       {"google_search": {}}
+#     ]
+
+#     model = genai.GenerativeModel(model_name=model_name)
+#     for attempt in range(max_retries):
+#         try:
+#             response = model.generate_content(
+#                         contents=[
+#                             {"role": "user", "content": prompt}
+#                         ],
+#                         generation_config=GenerationConfig(
+#                             tools=tools,
+#                         )
+#                     )
+
+#             # The API returns an object where `.text` holds the plain content.
+#             # Fallback to candidate text if `.text` is missing.
+#             if hasattr(response, "text") and response.text:
+#                 return response.text.strip()
+#             # Some SDK versions nest the text inside `candidates[0]`.
+#             if getattr(response, "candidates", None):
+#                 candidate = response.candidates[0]
+#                 text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
+#                 if text:
+#                     return str(text).strip()
+#             logger.warning(
+#                 f"Réponse vide de Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt: {prompt}"
+#             )
+#         except Exception as e:
+#             logger.error(
+#                 f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt}': {e}"
+#             )
+#         # If there are remaining attempts, sleep before the next try.
+#         if attempt < max_retries - 1:
+#             sleep_time = initial_delay * (2 ** attempt)
+#             logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
+#             time.sleep(sleep_time)
+#     logger.error(
+#         f"Toutes les tentatives ont échoué pour le prompt '{prompt}'. Retour d'une chaîne vide."
+#     )
+#     return ""
+
+
+# call with fallback to other API keys
 def call_gemini_with_retry(
     prompt: str,
     max_retries: int = 3,
     initial_delay: int = 5,
-    model_name: str = "gemini-2.5-flash"
+    model_name: str = DEFAULT_MODEL
 ) -> str:
-    """Call the Gemini API with retry logic and return the response text.
+    """Call the Gemini API with retry logic and fallback to alternative API keys.
 
-    This helper abstracts away repeated attempts to contact the model.  It does
+    This helper abstracts away repeated attempts to contact the model. It does
     not raise on failure; instead, it logs errors and returns an empty string
-    after exhausting retries.
+    after exhausting retries. It also attempts to use alternative API keys if configured.
 
     Args:
         prompt: The textual prompt to send to the model.
@@ -352,7 +419,41 @@ def call_gemini_with_retry(
     Returns:
         The model's textual response, or an empty string if all attempts fail.
     """
+    # Try alternative API keys if main one fails
+    # Format: "key1,key2,key3"
+    api_keys = os.environ.get("GEMINI_API_KEY", "").split(",")
+    if len(api_keys) <= 1:
+        return _call_gemini_single_key(prompt, max_retries, initial_delay, model_name)
+    
+    # We have multiple keys - try each one
+    logger.info(f"Found {len(api_keys)} API keys to try")
+    last_error = None
+    for i, api_key in enumerate(api_keys):
+        if not api_key.strip():
+            continue
+            
+        try:
+            # Configure with this specific key
+            genai.configure(api_key=api_key.strip())
+            result = _call_gemini_single_key(prompt, max_retries, initial_delay, model_name)
+            if result:  # If we got a valid response, return it
+                return result
+        except Exception as e:
+            last_error = e
+            logger.warning(f"API key {i+1} failed: {e}")
+    
+    # All keys failed
+    if last_error:
+        logger.error(f"All API keys failed. Last error: {last_error}")
+    return ""
 
+def _call_gemini_single_key(
+    prompt: str,
+    max_retries: int = 3,
+    initial_delay: int = 5,
+    model_name: str = DEFAULT_MODEL
+) -> str:
+    """Internal helper to call Gemini with a single configured API key"""
     tools = [
       {"url_context": {}},
       {"google_search": {}}
@@ -385,16 +486,13 @@ def call_gemini_with_retry(
             )
         except Exception as e:
             logger.error(
-                f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt}': {e}"
+                f"Erreur lors de l'appel à Gemini (tentative {attempt + 1}/{max_retries}) pour le prompt '{prompt[:50]}...': {e}"
             )
         # If there are remaining attempts, sleep before the next try.
         if attempt < max_retries - 1:
             sleep_time = initial_delay * (2 ** attempt)
             logger.info(f"Nouvelle tentative dans {sleep_time} secondes...")
             time.sleep(sleep_time)
-    logger.error(
-        f"Toutes les tentatives ont échoué pour le prompt '{prompt}'. Retour d'une chaîne vide."
-    )
     return ""
 
 
@@ -453,7 +551,7 @@ async def perform_watch_task() -> None:
         logger.error(f"Config '{SOURCES_FILE}' invalide: {e}. Veille annulée.")
         return
 
-    subjects_to_watch = config.veille_par_sujet
+    subjects_to_watch = config.keywords
     urls_to_watch = config.veille_par_url
 
     memory = safe_load_memory()
@@ -462,84 +560,93 @@ async def perform_watch_task() -> None:
     new_urls: Set[str] = set()
     new_details: Dict[str, Any] = {}
 
-    # Step 1: Start with all URLs from configuration
-    urls_to_process = list(urls_to_watch)
-    logger.info(f"Traitement de {len(urls_to_process)} URLs depuis la configuration")
-    
-    # Step 2: Scrape each URL and check for keywords
-    keyword_matches = {}  # URL -> [matched_keywords]
-    
-    # Préparer la liste des mots-clés en minuscules pour la recherche dans les pages
-    keywords_lower = [kw.lower() for kw in subjects_to_watch if kw]
-    
-    # Boucle de traitement des URLs
-    for url in urls_to_process:
-        if url in seen_urls_set:
-            logger.info(f"URL déjà analysée précédemment: '{url}'")
-            continue
-            
-        title, text = fetch_url_text(url)
-        if not text:
-            logger.info(f"Impossible de récupérer le contenu pour '{url}'")
-            continue
-        
-        # Détermine si la page contient au moins un des mots-clés suivis
-        text_lower = text.lower()
-        matched_keywords = [kw for kw in keywords_lower if kw in text_lower]
-        
-        if not matched_keywords:
-            logger.info(f"Aucun mot-clé trouvé dans '{url}', page ignorée")
-            continue
-            
-        # Si on arrive ici, on a trouvé au moins un mot-clé
-        keyword_matches[url] = matched_keywords
-        logger.info(f"URL '{url}' contient les mots-clés: {', '.join(matched_keywords)}")
-        new_urls.add(url)
+    # Step 1: For each keyword and each URL, do research and analysis
+    findings = []  # List of dicts: {"keyword", "url", "title", "summary", "source", "signal"}
+    for keyword in subjects_to_watch:
+        keyword_lower = keyword.lower()
+        for url in urls_to_watch:
+            # 1. Google Search for latest results (site:url keyword, last 24h)
+            search_prompt = (
+                f"Effectue une recherche Google sur le site '{url}' pour le mot-clé '{keyword}' "
+                f"et ne retiens que les résultats des dernières 24h. Pour chaque résultat, analyse le contenu et indique s'il y a un signal pertinent pour le mot-clé. "
+                f"Donne le titre, l'URL, un résumé et précise la nature du signal (nouveauté, tendance, alerte, etc)."
+            )
+            search_results = call_gemini_with_retry(prompt=search_prompt)
 
-    # Step 3: For each URL with keywords, generate summaries focused on those keywords
-    for url, matched_keywords in keyword_matches.items():
-        title, text = fetch_url_text(url)  # Re-fetch or use cached content
-        
-        # Créer un prompt qui met l'accent sur les mots-clés trouvés
-        context_prompt = (
-            f"Analyse cette page web et résume les actualités ou informations liées spécifiquement "
-            f"aux thématiques suivantes: {', '.join(matched_keywords)}.\n\n"
-            f"CONTENU DE LA PAGE:\n{text[:15000]}"
-        )
-        
-        summary = call_gemini_with_retry(prompt=context_prompt)
-        if not summary:
-            summary = f"Mots-clés trouvés: {', '.join(matched_keywords)}. Impossible de générer un résumé détaillé."
-        
-        new_details[url] = {
-            "title": title or "",
-            "summary": summary,
-            "matched_keywords": matched_keywords,
-            "text": text[:5000] if text else "",  # Limiter la taille pour économiser l'espace
-        }
-        logger.info(f"Résumé généré pour '{url}' avec les mots-clés {matched_keywords}")
+            # 2. Analyse directe de l'URL pour le mot-clé
+            title, text = fetch_url_text(url)
+            if text:
+                direct_prompt = (
+                    f"Analyse le contenu de cette page web pour le mot-clé '{keyword}'. "
+                    f"Indique s'il y a un signal important ou une actualité pertinente. Résume uniquement si le mot-clé est présent et pertinent.\n\n"
+                    f"CONTENU DE LA PAGE:\n{text[:15000]}"
+                )
+                direct_result = call_gemini_with_retry(prompt=direct_prompt)
+            else:
+                direct_result = ""
 
-    # Step 4: Build a synthetic report of all new items, organized by keyword
+            # 3. Parse and collect findings from both sources
+            # For Google Search results, try to extract items (simulate parsing)
+            if search_results:
+                # Assume Gemini returns a list of items in markdown or bullet format
+                for line in search_results.splitlines():
+                    if "http" in line:
+                        # Try to extract URL
+                        url_match = re.search(r'(https?://\S+)', line)
+                        found_url = url_match.group(1) if url_match else None
+                        if found_url and found_url not in seen_urls_set:
+                            findings.append({
+                                "keyword": keyword,
+                                "url": found_url,
+                                "title": title,
+                                "summary": line.strip(),
+                                "source": "google_search",
+                                "signal": "google_search"
+                            })
+            # For direct analysis, only add if signal and not duplicate
+            if direct_result and keyword_lower in text.lower() and url not in seen_urls_set:
+                findings.append({
+                    "keyword": keyword,
+                    "url": url,
+                    "title": title,
+                    "summary": direct_result.strip(),
+                    "source": "direct_url",
+                    "signal": "direct_url"
+                })
+
+    # Step 2: Filter out duplicates and already seen URLs
+    unique_findings = []
+    for item in findings:
+        if item["url"] not in seen_urls_set:
+            unique_findings.append(item)
+            new_urls.add(item["url"])
+            new_details[item["url"]] = {
+                "title": item["title"] or "",
+                "summary": item["summary"],
+                "matched_keywords": [item["keyword"]],
+                "source": item["source"],
+                "signal": item["signal"]
+            }
+
+    # Step 3: Build a synthetic report grouped by keyword
     report_text = ""
-    if new_details:
-        # Regrouper par mot-clé
-        keyword_to_urls = {}
-        for url, info in new_details.items():
-            for kw in info.get("matched_keywords", []):
-                if kw not in keyword_to_urls:
-                    keyword_to_urls[kw] = []
-                keyword_to_urls[kw].append(url)
-        
-        # Construire un prompt structuré par mot-clé
+    if unique_findings:
+        keyword_to_items = {}
+        for item in unique_findings:
+            kw = item["keyword"]
+            if kw not in keyword_to_items:
+                keyword_to_items[kw] = []
+            keyword_to_items[kw].append(item)
         lines = ["# Rapport de veille par thématique\n"]
-        for keyword, urls in keyword_to_urls.items():
+        for keyword, items in keyword_to_items.items():
             lines.append(f"\n## Thématique: {keyword}\n")
-            for url in urls:
-                info = new_details.get(url, {})
-                t = info.get("title") or "Sans titre"
-                s = info.get("summary") or "Pas de résumé disponible"
-                lines.append(f"- {t}\n  {url}\n  {s}\n")
-        
+            for item in items:
+                t = item.get("title") or "Sans titre"
+                u = item.get("url")
+                s = item.get("summary") or "Pas de résumé disponible"
+                src = item.get("source")
+                sig = item.get("signal")
+                lines.append(f"- {t}\n  {u}\n  Source: {src}\n  Signal: {sig}\n  {s}\n")
         report_prompt = (
             "Rédige un rapport synthétique (en français) sur les actualités suivantes, "
             "organisé par thématique. Pour chaque thématique, résume les points clés "
@@ -549,7 +656,7 @@ async def perform_watch_task() -> None:
         report = call_gemini_with_retry(prompt=report_prompt)
         report_text = report or "\n".join(lines)
 
-    # Step 5: Persist
+    # Step 4: Persist
     if new_urls:
         memory_seen = set(memory.get("seen_urls", []))
         memory_seen.update(new_urls)
@@ -569,8 +676,6 @@ async def perform_watch_task() -> None:
             reports_list = memory.get("reports", [])
             reports_list.append(report_entry)
             memory["reports"] = reports_list
-            
-            # Envoyer le rapport par email
             send_report_via_email(
                 subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
                 body=report_text
@@ -647,19 +752,19 @@ async def update_sources(update: UpdateSourcesRequest) -> Dict[str, Any]:
         new_config = update.replace
     else:
         new_config = SourceConfig(
-            veille_par_sujet=list(current_config.veille_par_sujet),
+            keywords=list(current_config.keywords),
             veille_par_url=list(current_config.veille_par_url),
         )
         if update.add_subjects:
             for subj in update.add_subjects:
-                if subj not in new_config.veille_par_sujet:
-                    new_config.veille_par_sujet.append(subj)
+                if subj not in new_config.keywords:
+                    new_config.keywords.append(subj)
         if update.add_urls:
             for url in update.add_urls:
                 if url not in new_config.veille_par_url:
                     new_config.veille_par_url.append(url)
         if update.remove_subjects:
-            new_config.veille_par_sujet = [s for s in new_config.veille_par_sujet if s not in update.remove_subjects]
+            new_config.keywords = [s for s in new_config.keywords if s not in update.remove_subjects]
         if update.remove_urls:
             new_config.veille_par_url = [u for u in new_config.veille_par_url if u not in update.remove_urls]
 
