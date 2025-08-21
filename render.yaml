@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: watcher
+    name: Veille-demo
     env: docker
     plan: free
     autoDeploy: true
