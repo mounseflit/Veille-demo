@@ -1,8 +1,8 @@
 {
-  "veille_par_sujet": [
-    "Quelles sont les dernières politiques publiques concernant l'intelligence artificielle au Maroc ?",
-    "Identifier les nouveaux appels à projets de l'Union Européenne sur la durabilité pour 2025",
-    "Quelles sont les dernières avancées publiées dans la recherche sur les batteries à état solide ?"
+  "keywords": [
+    "intelligence artificielle",
+    "durabilité",
+    "batteries"
   ],
   "veille_par_url": [
     "https://www.um6p.ma/fr/actualites"
