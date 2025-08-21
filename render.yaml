@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: Veille-demo
+    name: veille
     env: docker
     plan: free
     autoDeploy: true
