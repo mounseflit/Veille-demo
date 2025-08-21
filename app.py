@@ -325,7 +325,7 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
 
 def call_gemini_with_retry(
     prompt: str,
-    max_retries: int = 3,
+    max_retries: int = 2,
     initial_delay: int = 5,
     model_name: str = DEFAULT_MODEL,
 ) -> str:
@@ -349,7 +349,10 @@ def call_gemini_with_retry(
         try:
             genai.configure(api_key=key)
             # attempt call with single key
-            tools: List[Dict[str, Any]] = [{"url_context": {}}, {"google_search": {}}]
+            tools = [
+              {"url_context": {}},
+              {"google_search": {}}
+            ]
             model = genai.GenerativeModel(model_name=model_name)
             for attempt in range(max_retries):
                 try:
