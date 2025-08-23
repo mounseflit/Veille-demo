@@ -539,6 +539,7 @@ def watch_site_for_keywords(site: str, keywords: List[str]) -> List[Dict[str, st
     ).format(site=site, keywords=keywords_str)
     result = call_openai_with_search(prompt=prompt, search_context_size="high")
     text = result.get("text", "")
+    print(text)
     if not text:
         return []
     # Attempt to parse JSON array from the model output
@@ -562,6 +563,7 @@ def watch_site_for_keywords(site: str, keywords: List[str]) -> List[Dict[str, st
                 for item in data:
                     if isinstance(item, dict):
                         parsed_items.append(item)
+                print(parsed_items)
                 return parsed_items
     except Exception:
         pass
@@ -737,9 +739,11 @@ async def perform_watch_task() -> None:
                 memory_reports.append(report_entry)
                 memory["reports"] = memory_reports
                 # Send email
+                # Convert the text report to HTML with proper tables
+                html_report = convert_report_to_html(report_text)
                 send_report_via_email(
                     subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
-                    body=report_text,
+                    body=html_report
                 )
             # Save memory
             atomic_save_memory(memory)
@@ -755,6 +759,7 @@ async def perform_watch_task() -> None:
             pass
 
 
+
 # ---------------------------------------------------------------------------
 # Email sending
 
@@ -764,19 +769,16 @@ def send_report_via_email(subject: str, body: str) -> None:
     mail API. If no recipients are configured or requests is unavailable, the
     send is skipped.
     """
-    recipients = safe_load_recipients()
-    if not recipients:
-        logger.info("No recipients configured. Skipping email.")
-        return
+    
     # Compose payload
-    to_email = ", ".join(recipients)
+    to_email = "litnitimounsef@gmail.com"
     payload = {
         "to": to_email,
         "cc": "",
         "bcc": "",
         "subject": subject,
         "message": body,
-        "isHtml": False,
+        "isHtml": True,  # Set to True to render HTML content
         "attachments": [],
     }
     try:
@@ -786,16 +788,150 @@ def send_report_via_email(subject: str, body: str) -> None:
             timeout=15,
         )
         if response.ok:
-            logger.info(f"Report email successfully sent to {len(recipients)} recipients.")
+            print(f"Report email successfully sent to {to_email}.")
         else:
             try:
                 res_json = response.json()
                 err = res_json.get("error", "Unknown error")
             except Exception:
                 err = response.text
-            logger.error(f"Failed to send email: {err}")
+            print(f"Failed to send email: {err}")
     except Exception as e:
-        logger.error(f"Error sending email: {e}")
+        print(f"Error sending email: {e}")
+
+
+def convert_report_to_html(report_text: str) -> str:
+    """
+    Convert the plain text report to HTML with proper tables optimized for Gmail.
+    """
+    # Extract sections from the report
+    sections = report_text.split("---")
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    </head>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center;">
+            <h1 style="color: #0056b3; border-bottom: 2px solid #0056b3; padding-bottom: 10px;">RAPPORT DE VEILLE STRATÉGIQUE</h1>
+            <p style="color: #666; font-style: italic; margin-bottom: 20px;">Date: 23 août 2025</p>
+        </div>
+        
+        <table cellspacing="0" cellpadding="8" border="1" style="width: 100%; border-collapse: collapse; margin-bottom: 30px;">
+            <tr style="background-color: #0056b3; color: white;">
+                <th style="padding: 12px; text-align: left; font-weight: bold;">SOURCE</th>
+                <th style="padding: 12px; text-align: left; font-weight: bold;">DATE</th>
+                <th style="padding: 12px; text-align: left; font-weight: bold;">RÉSUMÉ</th>
+                <th style="padding: 12px; text-align: left; font-weight: bold;">IMPLICATIONS</th>
+                <th style="padding: 12px; text-align: left; font-weight: bold;">RECOMMANDATIONS</th>
+                <th style="padding: 12px; text-align: left; font-weight: bold;">LIEN</th>
+            </tr>
+    """
+    
+    # Process each section
+    row_count = 0
+    for section in sections:
+        if not section.strip():
+            continue
+            
+        # Extract data from the section
+        source_match = re.search(r'\*\*SOURCE\*\* : (.*?)(?:\n\n|$)', section)
+        date_match = re.search(r'\*\*DATE\*\* : (.*?)(?:\n\n|$)', section)
+        resume_match = re.search(r'\*\*RÉSUMÉ\*\* : (.*?)(?:\n\n|$)', section)
+        implications_match = re.search(r'\*\*IMPLICATIONS POUR UM6P\*\* : (.*?)(?:\n\n|$)', section)
+        recommendations_match = re.search(r'\*\*RECOMMANDATIONS\*\* :\s*\n\n((?:[\d]+\..*?\n)+)', section)
+        link_match = re.search(r'\*\*LIEN\*\* : \[(.*?)\]\((.*?)\)', section)
+        
+        source = source_match.group(1) if source_match else "Non spécifiée"
+        date = date_match.group(1) if date_match else "Non spécifiée"
+        resume = resume_match.group(1) if resume_match else "Non disponible"
+        implications = implications_match.group(1) if implications_match else "Non analysées"
+        
+        recommendations = ""
+        if recommendations_match:
+            rec_items = re.findall(r'(\d+\.\s*.*?)(?:\n|$)', recommendations_match.group(1))
+            recommendations = "<ol style='margin: 0; padding-left: 20px;'>" + "".join([f"<li style='margin-bottom: 5px;'>{item}</li>" for item in rec_items]) + "</ol>"
+        else:
+            recommendations = "Non disponibles"
+            
+        link_text = "Article original"
+        link_url = ""
+        if link_match:
+            link_text = link_match.group(1)
+            link_url = link_match.group(2)
+            link_html = f"<a href='{link_url}' style='color: #0056b3; text-decoration: none;' target='_blank'>{link_text}</a>"
+        else:
+            link_html = "Non disponible"
+            
+        # Alternate row background color for better readability
+        bg_color = "#f2f8ff" if row_count % 2 == 1 else "#ffffff"
+        row_count += 1
+        
+        # Add row to HTML table with inline styles for Gmail compatibility
+        html += f"""
+            <tr style="background-color: {bg_color};">
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{source}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{date}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{resume}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{implications}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{recommendations}</td>
+                <td style="padding: 10px; border: 1px solid #ddd; vertical-align: top;">{link_html}</td>
+            </tr>
+        """
+    
+    # Close the HTML
+    html += """
+        </table>
+        <div style="font-size: 12px; color: #666; text-align: center; margin-top: 20px;">
+            Rapport généré automatiquement. Pour toute question, veuillez contacter le service de veille.
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
+# def send_report_via_email(subject: str, body: str) -> None:
+#     """
+#     Send the report via email to all configured recipients using an external
+#     mail API. If no recipients are configured or requests is unavailable, the
+#     send is skipped.
+#     """
+#     recipients = safe_load_recipients()
+#     if not recipients:
+#         logger.info("No recipients configured. Skipping email.")
+#         return
+#     # Compose payload
+#     to_email = ", ".join(recipients)
+#     payload = {
+#         "to": to_email,
+#         "cc": "",
+#         "bcc": "",
+#         "subject": subject,
+#         "message": body,
+#         "isHtml": False,
+#         "attachments": [],
+#     }
+#     try:
+#         response = http_client.session.post(
+#             "https://mail-api-mounsef.vercel.app/api/send-email",
+#             json=payload,
+#             timeout=15,
+#         )
+#         if response.ok:
+#             logger.info(f"Report email successfully sent to {len(recipients)} recipients.")
+#         else:
+#             try:
+#                 res_json = response.json()
+#                 err = res_json.get("error", "Unknown error")
+#             except Exception:
+#                 err = response.text
+#             logger.error(f"Failed to send email: {err}")
+#     except Exception as e:
+#         logger.error(f"Error sending email: {e}")
 
 
 # ---------------------------------------------------------------------------
