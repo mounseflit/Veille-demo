@@ -686,6 +686,14 @@ async def perform_watch_task() -> None:
             )
             result = call_openai_with_search(prompt=report_prompt, search_context_size="high")
             report_text = result.get("text", "")
+
+            if report_text:
+            # Convert the text report to HTML with proper tables
+                html_report = convert_report_to_html(report_text)
+                send_report_via_email(
+                    subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
+                    body=html_report
+                )
             if not report_text:
                 # Build fallback report manually - email-friendly format
                 today = datetime.datetime.now().strftime("%d/%m/%Y")
@@ -739,12 +747,11 @@ async def perform_watch_task() -> None:
                 memory_reports.append(report_entry)
                 memory["reports"] = memory_reports
                 # Send email
-                # Convert the text report to HTML with proper tables
-                html_report = convert_report_to_html(report_text)
                 send_report_via_email(
                     subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
-                    body=html_report
+                    body=report_text,
                 )
+                
             # Save memory
             atomic_save_memory(memory)
         else:
@@ -770,8 +777,12 @@ def send_report_via_email(subject: str, body: str) -> None:
     send is skipped.
     """
     
+    recipients = safe_load_recipients()
+    if not recipients:
+        logger.info("No recipients configured. Skipping email.")
+        return
     # Compose payload
-    to_email = "litnitimounsef@gmail.com"
+    to_email = ", ".join(recipients)
     payload = {
         "to": to_email,
         "cc": "",
@@ -788,16 +799,16 @@ def send_report_via_email(subject: str, body: str) -> None:
             timeout=15,
         )
         if response.ok:
-            print(f"Report email successfully sent to {to_email}.")
+            logger.info(f"Report email successfully sent to {len(recipients)} recipients.")
         else:
             try:
                 res_json = response.json()
                 err = res_json.get("error", "Unknown error")
             except Exception:
                 err = response.text
-            print(f"Failed to send email: {err}")
+            logger.error(f"Failed to send email: {err}")
     except Exception as e:
-        print(f"Error sending email: {e}")
+        logger.error(f"Error sending email: {e}")
 
 
 def convert_report_to_html(report_text: str) -> str:
