@@ -647,8 +647,8 @@ async def perform_watch_task() -> None:
                 link = normalize_url(str(entry.get("Lien", "")))
                 if not link:
                     continue
-                if link in seen_urls_set:
-                    continue
+                # if link in seen_urls_set:
+                #     continue
                 # Mark as seen and accumulate
                 seen_urls_set.add(link)
                 new_urls.add(link)
@@ -662,43 +662,65 @@ async def perform_watch_task() -> None:
                 json_results = json.dumps(all_results, ensure_ascii=False)
             except Exception:
                 json_results = str(all_results)
+
+
             report_prompt = (
                 "Vous êtes un assistant de veille stratégique. "
-                "À partir de la liste JSON suivante d'actualités, génère un rapport structuré "
-                "sous forme de tableau Markdown. Le tableau doit avoir les colonnes suivantes : "
-                "Source, Contexte et Résumé de la publication, Date de Publication, "
-                "Implications et Impacts sur UM6P, Recommandations Stratégiques pour UM6P, Lien. "
-                "Chaque ligne du tableau doit synthétiser l'entrée correspondante avec des phrases courtes "
-                "et éviter les longues descriptions. "
-                "Après le tableau, ajoute un court paragraphe de synthèse générale (2-3 phrases) "
-                "et 2-3 recommandations actionnables pour UM6P. "
+                "À partir de la liste JSON suivante d'actualités, génère un rapport structuré pour envoi par email. "
+                "Commence par un titre 'RAPPORT DE VEILLE STRATÉGIQUE' et la date du jour. "
+                "Ensuite, pour chaque actualité, crée une section bien formatée avec les rubriques suivantes : "
+                "\n\n1. SOURCE: [nom de la source]\n"
+                "2. DATE: [date de publication]\n"
+                "3. RÉSUMÉ: [résumé concis]\n"
+                "4. IMPLICATIONS POUR UM6P: [analyse d'impact]\n"
+                "5. RECOMMANDATIONS: [actions suggérées]\n"
+                "6. LIEN: [URL complète]\n"
+                "\nSépare chaque section par une ligne de tirets pour améliorer la lisibilité. "
+                "À la fin du rapport, ajoute une section 'SYNTHÈSE GLOBALE' avec 2-3 paragraphes courts "
+                "et une section 'RECOMMANDATIONS PRIORITAIRES' avec 2-3 points actionnables clairs. "
+                "Optimise le format pour la lecture dans un client email standard (évite les tableaux complexes et les formatages élaborés). "
                 "Voici la liste JSON:\n\n"
                 f"{json_results}"
             )
             result = call_openai_with_search(prompt=report_prompt, search_context_size="high")
             report_text = result.get("text", "")
             if not report_text:
-                # Build fallback table manually
-                headers = [
-                    "Source",
-                    "Contexte et Résumé de la publication",
-                    "Date de Publication",
-                    "Implications et Impacts sur UM6P",
-                    "Recommandations Stratégiques pour UM6P",
-                    "Lien",
+                # Build fallback report manually - email-friendly format
+                today = datetime.datetime.now().strftime("%d/%m/%Y")
+                lines = [
+                    "RAPPORT DE VEILLE STRATÉGIQUE - " + today,
+                    "=" * 50,
+                    "\n"
                 ]
-                lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
-                for entry in all_results:
-                    row = [
-                        str(entry.get("Source", "")) or "",
-                        str(entry.get("Contexte et Résumé de la publication", "")) or "",
-                        str(entry.get("Date de Publication", "")) or "",
-                        str(entry.get("Implications et Impacts sur UM6P", "")) or "",
-                        str(entry.get("Recommandations Stratégiques pour UM6P", "")) or "",
-                        str(entry.get("Lien", "")) or "",
-                    ]
-                    lines.append(" | ".join(row))
+                for i, entry in enumerate(all_results, 1):
+                    lines.extend([
+                        f"ACTUALITÉ #{i}",
+                        "-" * 30,
+                        f"SOURCE: {str(entry.get('Source', 'Non spécifiée'))}",
+                        f"DATE: {str(entry.get('Date de Publication', 'Non spécifiée'))}",
+                        f"RÉSUMÉ: {str(entry.get('Contexte et Résumé de la publication', 'Non disponible'))}",
+                        f"IMPLICATIONS POUR UM6P: {str(entry.get('Implications et Impacts sur UM6P', 'Non analysées'))}",
+                        f"RECOMMANDATIONS: {str(entry.get('Recommandations Stratégiques pour UM6P', 'Non disponibles'))}",
+                        f"LIEN: {str(entry.get('Lien', ''))}",
+                        "\n" + "-" * 50 + "\n"
+                    ])
+                
+                # Complete the fallback report with a synthesis section
+                lines.extend([
+                    "\nSYNTHÈSE GLOBALE",
+                    "=" * 30,
+                    f"Ce rapport contient {len(all_results)} actualités pertinentes relatives aux mots-clés suivis.",
+                    "Veuillez analyser les implications et recommandations pour chaque élément.",
+                    "\nRECOMMANDATIONS PRIORITAIRES",
+                    "=" * 30,
+                    "1. Examiner en détail les actualités signalées et valider leur pertinence.",
+                    "2. Partager les informations importantes avec les équipes concernées.",
+                    "3. Planifier une réunion de suivi pour discuter des actions à entreprendre."
+                ])
+                
                 report_text = "\n".join(lines)
+        
+        
         # Persist memory and send report
         if new_urls:
             memory["seen_urls"] = list(seen_urls_set)
