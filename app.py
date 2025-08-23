@@ -344,7 +344,7 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
 
 def call_openai_with_search(
     prompt: str,
-    max_retries: int = 2,
+    max_retries: int = 3,
     initial_delay: int = 5,
     model_name: str = OPENAI_SEARCH_MODEL,
     search_context_size: str = "medium",
@@ -529,8 +529,8 @@ def watch_site_for_keywords(site: str, keywords: List[str]) -> List[Dict[str, st
     # Construct prompt instructing the model to perform a comprehensive site search.
     prompt = (
         "Vous êtes un assistant de veille stratégique. "
-        "Sur le site suivant: {site}, recherchez toutes les publications des dernières 48 heures "
-        "qui traitent des mots-clés suivants: {keywords}. "
+        f"Sur le site suivant: {site}, recherchez toutes les publications des dernières 48 heures "
+        f"qui traitent des mots-clés suivants: {keywords}. "
         "Pour chaque publication trouvée, renvoyez un tableau JSON (array) d'objets avec les champs suivants: "
         "\"Source\", \"Contexte et Résumé de la publication\", \"Date de Publication\", "
         "\"Implications et Impacts sur UM6P\", \"Recommandations Stratégiques pour UM6P\", \"Lien\". "
@@ -640,6 +640,7 @@ async def perform_watch_task() -> None:
             if not site:
                 continue
             try:
+                print(f"Watching : {site}")
                 site_results = watch_site_for_keywords(site, keywords)
             except Exception as e:
                 logger.error(f"Error watching site {site}: {e}")
@@ -649,8 +650,8 @@ async def perform_watch_task() -> None:
                 link = normalize_url(str(entry.get("Lien", "")))
                 if not link:
                     continue
-                # if link in seen_urls_set:
-                #     continue
+                if link in seen_urls_set:
+                    continue
                 # Mark as seen and accumulate
                 seen_urls_set.add(link)
                 new_urls.add(link)
