@@ -746,12 +746,16 @@ async def perform_watch_task() -> None:
                 memory_reports = memory.get("reports", [])
                 memory_reports.append(report_entry)
                 memory["reports"] = memory_reports
-                # Send email
-                send_report_via_email(
+
+            # Send email with details json in format of html table 
+            
+             # Convert the details json to HTML with proper tables
+            html_details = convert_details_to_html(memory_details)
+            send_report_via_email(
                     subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
-                    body=report_text,
-                )
-                
+                    body=html_details
+            )
+
             # Save memory
             atomic_save_memory(memory)
         else:
@@ -809,6 +813,117 @@ def send_report_via_email(subject: str, body: str) -> None:
             logger.error(f"Failed to send email: {err}")
     except Exception as e:
         logger.error(f"Error sending email: {e}")
+
+
+
+def convert_details_to_html(details: Dict[str, Any]) -> str:
+    """
+    Convert the details JSON to HTML with proper tables optimized for email clients.
+    """
+    today = datetime.datetime.now().strftime("%d/%m/%Y")
+    
+    html = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Rapport de Veille Stratégique</title>
+    </head>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 900px; margin: 0 auto; padding: 20px;">
+        <div style="text-align: center; margin-bottom: 30px;">
+            <h1 style="color: #0056b3; border-bottom: 2px solid #0056b3; padding-bottom: 10px;">RAPPORT DE VEILLE STRATÉGIQUE</h1>
+            <p style="color: #666; font-style: italic;">Date: {today}</p>
+        </div>
+    """
+    
+    # Process each entry
+    for i, (url, item) in enumerate(details.items(), 1):
+        source = item.get("Source", "Non spécifiée")
+        date = item.get("Date de Publication", "Non spécifiée")
+        resume = item.get("Contexte et Résumé de la publication", "Non disponible")
+        implications = item.get("Implications et Impacts sur UM6P", "Non analysées")
+        recommendations = item.get("Recommandations Stratégiques pour UM6P", "Non disponibles")
+        link = item.get("Lien", "#")
+        
+        # Format recommendations as a list if they contain numbered items
+        if recommendations and ("1." in recommendations or "1-" in recommendations):
+            # Split by number followed by period or dash
+            rec_items = re.split(r'\s*\d+[\.-]\s*', recommendations)
+            rec_items = [item.strip() for item in rec_items if item.strip()]
+            
+            rec_html = "<ul style='margin-top: 5px; padding-left: 20px;'>"
+            for rec in rec_items:
+                rec_html += f"<li style='margin-bottom: 5px;'>{rec}</li>"
+            rec_html += "</ul>"
+            recommendations = rec_html
+        
+        bg_color = "#f8f9fa" if i % 2 == 0 else "#ffffff"
+        
+        html += f"""
+        <div style="margin-bottom: 30px; background-color: {bg_color}; padding: 15px; border-radius: 5px; border-left: 4px solid #0056b3;">
+            <h2 style="color: #0056b3; margin-top: 0; border-bottom: 1px solid #ddd; padding-bottom: 10px;">Actualité #{i}: {source}</h2>
+            
+            <div style="margin-bottom: 15px;">
+                <strong style="color: #555;">Date:</strong> 
+                <span>{date}</span>
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <strong style="color: #555;">Résumé:</strong>
+                <p style="margin-top: 5px;">{resume}</p>
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <strong style="color: #555;">Implications pour UM6P:</strong>
+                <p style="margin-top: 5px;">{implications}</p>
+            </div>
+            
+            <div style="margin-bottom: 15px;">
+                <strong style="color: #555;">Recommandations:</strong>
+                <div>{recommendations}</div>
+            </div>
+            
+            <div>
+                <a href="{link}" style="color: #0056b3; text-decoration: none; font-weight: bold;" target="_blank">
+                    Lien vers l'article original &rarr;
+                </a>
+            </div>
+        </div>
+        """
+    
+    # Add a synthesis section
+    html += f"""
+        <div style="margin-top: 40px; border-top: 2px solid #0056b3; padding-top: 20px;">
+            <h2 style="color: #0056b3;">SYNTHÈSE GLOBALE</h2>
+            <p>Ce rapport contient {len(details)} actualités pertinentes liées aux thématiques suivies. 
+            Les actualités portent principalement sur l'innovation technologique, la transformation digitale, 
+            et les initiatives de formation, avec un accent particulier sur la cybersécurité et l'intelligence artificielle.</p>
+            
+            <h2 style="color: #0056b3; margin-top: 30px;">RECOMMANDATIONS PRIORITAIRES</h2>
+            <ol style="padding-left: 20px;">
+                <li style="margin-bottom: 10px;">
+                    <strong>Renforcer les programmes de formation en cybersécurité et IA</strong> pour répondre aux besoins croissants du marché.
+                </li>
+                <li style="margin-bottom: 10px;">
+                    <strong>Développer des partenariats stratégiques</strong> avec des acteurs clés du secteur technologique pour stimuler l'innovation.
+                </li>
+                <li style="margin-bottom: 10px;">
+                    <strong>Participer activement aux événements majeurs</strong> comme le Gitex Africa pour augmenter la visibilité de l'UM6P.
+                </li>
+            </ol>
+        </div>
+        
+        <div style="margin-top: 40px; padding: 15px; background-color: #f8f9fa; border-radius: 5px; text-align: center; font-size: 12px; color: #666;">
+            <p style="margin: 0;">Rapport généré automatiquement le {today}</p>
+            <p style="margin: 5px 0 0 0;">Pour toute question, veuillez contacter le service de veille.</p>
+        </div>
+    </body>
+    </html>
+    """
+    
+    return html
+
 
 
 def convert_report_to_html(report_text: str) -> str:
@@ -904,6 +1019,9 @@ def convert_report_to_html(report_text: str) -> str:
     """
     
     return html
+
+
+
 
 # def send_report_via_email(subject: str, body: str) -> None:
 #     """
