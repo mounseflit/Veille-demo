@@ -65,10 +65,7 @@ LOCK_FILE = os.path.join(DATA_DIR, ".watch_lock")
 # We use OpenAI's Chat Completions with the web search tool enabled to
 # summarise pages and compile reports. The model name and the default
 # location used for search results can be overridden via environment variables.
-#
-# See OpenAI documentation for details on the `search_context_size` parameter,
-# which controls how much context is retrieved from the web【122901823563527†L448-L472】,
-# and the `user_location` parameter, which biases search results to a region【122901823563527†L368-L374】.
+
 from openai import OpenAI
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
