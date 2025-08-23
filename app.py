@@ -687,13 +687,13 @@ async def perform_watch_task() -> None:
             result = call_openai_with_search(prompt=report_prompt, search_context_size="high")
             report_text = result.get("text", "")
 
-            if report_text:
-            # Convert the text report to HTML with proper tables
-                html_report = convert_report_to_html(report_text)
-                send_report_via_email(
-                    subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
-                    body=html_report
-                )
+            # if report_text:
+            # # Convert the text report to HTML with proper tables
+            #     html_report = convert_report_to_html(report_text)
+            #     send_report_via_email(
+            #         subject=f"Rapport de veille - {len(new_urls)} nouvelles actualités",
+            #         body=html_report
+            #     )
             if not report_text:
                 # Build fallback report manually - email-friendly format
                 today = datetime.datetime.now().strftime("%d/%m/%Y")
