@@ -19,13 +19,6 @@ except Exception:
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ValidationError
-try:
-    import google.generativeai as genai  # type: ignore
-    from google.generativeai.types.generation_types import GenerationConfig  # type: ignore
-except Exception:
-    # Gemini is optional. When not available, summarization will return empty strings.
-    genai = None  # type: ignore
-    GenerationConfig = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Logging configuration
@@ -37,32 +30,58 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Constants and configuration
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Configuration files
+# Directory for persisting configuration and state
 DATA_DIR = os.getenv("WATCHER_DATA_DIR", ".")
+
+# Files for persisting sources, memory and recipients
 SOURCES_FILE: str = os.path.join(DATA_DIR, "sources.json")
 MEMORY_FILE: str = os.path.join(DATA_DIR, "memory_db.json")
 RECIPIENTS_FILE: str = os.path.join(DATA_DIR, "recipients.json")
 
+# Default in‑memory structure
 DEFAULT_MEMORY: Dict[str, Any] = {
     "seen_urls": [],
     "details": {},
     "reports": [],
 }
 
-# Memory limits
+# Limits for memory – keeps disk usage bounded
 MAX_SEEN_URLS = int(os.getenv("WATCHER_MAX_SEEN_URLS", "10000"))
 MAX_REPORTS = int(os.getenv("WATCHER_MAX_REPORTS", "100"))
 
-# User agent for requests
+# User agent for HTTP requests
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; WatcherBot/2.0; +https://example.com/bot) "
+    "Mozilla/5.0 (compatible; WatcherBot/3.0; +https://example.com/bot) "
     "PythonRequests"
 )
 
-# Concurrency lock file
+# Lock file to avoid concurrent watcher runs
 LOCK_FILE = os.path.join(DATA_DIR, ".watch_lock")
+
+# ---------------------------------------------------------------------------
+# OpenAI configuration
+#
+# We use OpenAI's Chat Completions with the web search tool enabled to
+# summarise pages and compile reports. The model name and the default
+# location used for search results can be overridden via environment variables.
+#
+# See OpenAI documentation for details on the `search_context_size` parameter,
+# which controls how much context is retrieved from the web【122901823563527†L448-L472】,
+# and the `user_location` parameter, which biases search results to a region【122901823563527†L368-L374】.
+from openai import OpenAI
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    logger.error("OPENAI_API_KEY environment variable not set. API calls will fail.")
+
+OPENAI_SEARCH_MODEL = os.getenv("OPENAI_SEARCH_MODEL", "gpt-4o-search-preview")
+OPENAI_LOCATION = {
+    "country": os.getenv("WATCHER_COUNTRY", "MA"),
+    "city": os.getenv("WATCHER_CITY", "Casablanca"),
+    "region": os.getenv("WATCHER_REGION", "Casablanca-Settat"),
+}
+oa_client = OpenAI(api_key=OPENAI_API_KEY)
 
 # ---------------------------------------------------------------------------
 # Utility functions
@@ -321,199 +340,236 @@ def fetch_url_text(url: str, timeout: int = 12) -> Tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# LLM helpers
+# OpenAI helpers
 
-def call_gemini_with_retry(
+def call_openai_with_search(
     prompt: str,
     max_retries: int = 2,
     initial_delay: int = 5,
-    model_name: str = DEFAULT_MODEL,
-) -> str:
+    model_name: str = OPENAI_SEARCH_MODEL,
+    search_context_size: str = "medium",
+) -> Dict[str, Any]:
     """
-    Call the Gemini API with retry logic and fall back to alternative API keys.
-    Returns the response text or an empty string on failure.
+    Call OpenAI's Chat Completions API with the web search tool enabled.
+
+    Returns a dictionary with keys:
+      - 'text': the generated text (may include inline citations)
+      - 'citations': list of citations (URL, title, start, end indices)
+
+    Retries on errors up to `max_retries` times with exponential backoff.
     """
-    # If Gemini SDK is unavailable, return empty string
-    if genai is None or GenerationConfig is None:
-        logger.warning("google.generativeai is not installed. Skipping Gemini summarization.")
-        return ""
-    api_keys = os.environ.get("GEMINI_API_KEY", "").split(",")
-    if not api_keys or not api_keys[0]:
-        logger.error("GEMINI_API_KEY is not configured.")
-        return ""
     last_error: Optional[Exception] = None
-    for key in api_keys:
-        key = key.strip()
-        if not key:
-            continue
+    for attempt in range(max_retries):
         try:
-            genai.configure(api_key=key)
-            # attempt call with single key
-            tools = [
-              {"url_context": {}},
-              {"google_search": {}}
-            ]
-            model = genai.GenerativeModel(model_name=model_name)
-            for attempt in range(max_retries):
-                try:
-                    response = model.generate_content(
-                        contents=[
-                            {"role": "user", "content": prompt}
-                        ],
-                        tools=tools,
-                        generation_config=GenerationConfig()
+            resp = oa_client.chat.completions.create(
+                model=model_name,
+                web_search_options={
+                    "search_context_size": search_context_size,
+                    "user_location": {
+                        "type": "approximate",
+                        "approximate": OPENAI_LOCATION,
+                    },
+                },
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a monitoring assistant. "
+                            "Answer concisely in the language of the prompt and include inline citations."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            msg = resp.choices[0].message
+            content = msg.content or ""
+            citations: List[Dict[str, Any]] = []
+            for ann in getattr(msg, "annotations", []) or []:
+                if getattr(ann, "type", "") == "url_citation" and hasattr(ann, "url_citation"):
+                    uc = ann.url_citation
+                    citations.append(
+                        {
+                            "url": uc.url,
+                            "title": uc.title,
+                            "start": uc.start_index,
+                            "end": uc.end_index,
+                        }
                     )
-                    # response = model.generate_content(
-                    #     contents=[{"role": "user", "content": prompt}],
-                    #     generation_config=GenerationConfig(tools=tools),
-                    # )
-                    if hasattr(response, "text") and response.text:
-                        return response.text.strip()
-                    if getattr(response, "candidates", None):
-                        candidate = response.candidates[0]
-                        text = getattr(candidate, "text", "") or getattr(candidate, "content", "")
-                        if text:
-                            return str(text).strip()
-                    logger.warning(
-                        f"Empty response from Gemini (attempt {attempt + 1}/{max_retries})"
-                    )
-                except Exception as e:
-                    last_error = e
-                    logger.error(
-                        f"Gemini error (attempt {attempt + 1}/{max_retries}): {e}"
-                    )
-                # Backoff
-                if attempt < max_retries - 1:
-                    sleep_time = initial_delay * (2 ** attempt)
-                    time.sleep(sleep_time)
+            return {"text": content.strip(), "citations": citations}
         except Exception as e:
             last_error = e
-            logger.error(f"Failed to configure Gemini with provided API key: {e}")
-    if last_error:
-        logger.error(f"All Gemini calls failed. Last error: {last_error}")
-    return ""
+            logger.error(f"OpenAI web search error (attempt {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                # exponential backoff
+                time.sleep(initial_delay * (2 ** attempt))
+    logger.error(f"All OpenAI calls failed. Last error: {last_error}")
+    return {"text": "", "citations": []}
 
 
 def summarize_with_url_context(url: str, scraped_text: str) -> str:
     """
-    Summarize the content of a URL using Gemini. The URL is passed in the prompt
-    to give the model context. Falls back to summarizing the scraped text.
+    Summarise the content of a URL using OpenAI's web search tool. The URL
+    itself is provided in the prompt to anchor the search. If the call
+    fails or returns empty, a fallback summarisation using the scraped text
+    is attempted.
     """
+    # Primary prompt referencing the URL
     url_prompt = (
         "Analyse et résume précisément en français le contenu de cette URL. "
-        "Mets en avant les mises à jour, nouvelles informations et points clés. "
-        "Structure la réponse avec des puces claires et un court paragraphe de synthèse à la fin."
+        "Mets en avant les nouvelles informations et points clés, en indiquant les dates si elles sont présentes. "
+        "Structure la réponse en puces, suivie d'un court paragraphe de synthèse. "
+        "Ajoute des citations en ligne pour les sources utilisées."
     )
     try:
         combined_prompt = f"{url_prompt}\n\nURL: {url}"
-        text = call_gemini_with_retry(prompt=combined_prompt)
-        if text:
-            return text
+        result = call_openai_with_search(prompt=combined_prompt, search_context_size="medium")
+        if result["text"]:
+            return result["text"]
     except Exception as e:
-        logger.info(f"URL context summarization failed for {url}: {e}")
+        logger.info(f"OpenAI URL summarisation failed for {url}: {e}")
+    # Fallback: summarise the scraped text directly
     if scraped_text:
         fallback_prompt = (
             "Voici le contenu d'une page web. Résume-le en français, en listant d'abord les points clés, "
-            "puis une synthèse courte et actionnable.\n\n"
+            "puis une synthèse courte et actionnable. Ajoute des citations si possible.\n\n"
             f"CONTENU:\n{scraped_text[:15000]}"
         )
-        return call_gemini_with_retry(prompt=fallback_prompt) or "Aucune description disponible pour cette URL."
+        result = call_openai_with_search(prompt=fallback_prompt, search_context_size="low")
+        if result["text"]:
+            return result["text"]
     return "Aucune description disponible pour cette URL."
 
 
-# ---------------------------------------------------------------------------
-# Search helper (optional)
-
-def perform_search(
-    keyword: str, site: str, max_results: int = 5, time_window_days: int = 1
+def perform_search_openai(
+    keyword: str,
+    site: str,
+    max_results: int = 5,
+    time_window_hours: int = 48,
 ) -> List[Dict[str, str]]:
     """
-    Perform a search for the given keyword on a specific site using an external
-    search API (e.g. Google Custom Search or Bing). Returns a list of results
-    with keys: title, url, snippet. If no API is configured, returns an empty list.
-
-    You can configure the search engine by setting environment variables:
-      - GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX for Google Custom Search Engine
-      - BING_API_KEY for Bing Web Search
-    The time_window_days parameter may be ignored depending on the API used.
+    Use OpenAI's web search tool to find recent pages for `site` and `keyword`.
+    Returns a list of dictionaries with keys: title, url, snippet.
+    If parsing fails or the model returns non-JSON, an empty list is returned.
     """
-    results: List[Dict[str, str]] = []
-    # Google Custom Search
-    g_key = os.getenv("GOOGLE_CSE_API_KEY")
-    g_cx = os.getenv("GOOGLE_CSE_CX")
-    if g_key and g_cx:
-        try:
-            query = f"site:{site} {keyword}"
-            # restrict to last X days is not directly supported; we rely on API ranking
-            url = "https://www.googleapis.com/customsearch/v1"
-            params = {
-                "key": g_key,
-                "cx": g_cx,
-                "q": query,
-                "num": max_results,
-            }
-            resp = http_client.session.get(url, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                items = data.get("items", [])
-                for item in items:
-                    link = item.get("link")
-                    title = item.get("title")
-                    snippet = item.get("snippet")
-                    if link:
-                        results.append(
+    prompt = (
+        "Find the most recent pages in the last {hrs} hours relevant to the following search query:\n"
+        f"site:{site} {keyword}\n\n"
+        "Return a STRICT JSON array of objects with keys: title, url, snippet. "
+        "Do not include any extra text before or after the JSON. Limit the list to {limit} items."
+    ).format(hrs=time_window_hours, limit=max_results)
+    result = call_openai_with_search(prompt=prompt, search_context_size="low")
+    text = result.get("text", "")
+    if not text:
+        return []
+    # Try to parse JSON from the model output
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            parsed_items: List[Dict[str, str]] = []
+            for item in data[:max_results]:
+                try:
+                    parsed_items.append(
+                        {
+                            "title": str(item.get("title", "")),
+                            "url": str(item.get("url", "")),
+                            "snippet": str(item.get("snippet", "")),
+                        }
+                    )
+                except Exception:
+                    continue
+            return parsed_items
+    except Exception:
+        pass
+    # Fallback: attempt to extract JSON array from text
+    try:
+        match = re.search(r"\[\s*\{.*?\}\s*\]", text, re.S)
+        if match:
+            data = json.loads(match.group(0))
+            if isinstance(data, list):
+                parsed_items: List[Dict[str, str]] = []
+                for item in data[:max_results]:
+                    try:
+                        parsed_items.append(
                             {
-                                "title": title or "",
-                                "url": link,
-                                "snippet": snippet or "",
+                                "title": str(item.get("title", "")),
+                                "url": str(item.get("url", "")),
+                                "snippet": str(item.get("snippet", "")),
                             }
                         )
-                return results
-            else:
-                logger.warning(
-                    f"Google CSE API returned status {resp.status_code}: {resp.text}"
-                )
-        except Exception as e:
-            logger.warning(f"Google CSE API error: {e}")
+                    except Exception:
+                        continue
+                return parsed_items
+    except Exception:
+        pass
+    return []
 
-    # Bing Search (via RapidAPI or similar)
-    bing_key = os.getenv("BING_API_KEY")
-    if bing_key:
-        try:
-            query = f"site:{site} {keyword}"
-            url = "https://api.bing.microsoft.com/v7.0/search"
-            headers = {"Ocp-Apim-Subscription-Key": bing_key}
-            params = {"q": query, "count": max_results}
-            resp = http_client.session.get(url, headers=headers, params=params, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                web_pages = data.get("webPages", {}).get("value", [])
-                for item in web_pages:
-                    link = item.get("url")
-                    title = item.get("name")
-                    snippet = item.get("snippet")
-                    if link:
-                        results.append(
-                            {
-                                "title": title or "",
-                                "url": link,
-                                "snippet": snippet or "",
-                            }
-                        )
-                return results
-            else:
-                logger.warning(
-                    f"Bing API returned status {resp.status_code}: {resp.text}"
-                )
-        except Exception as e:
-            logger.warning(f"Bing API error: {e}")
 
-    # No API configured or all failed
-    return results
+# New helper: watch a site for multiple keywords using OpenAI web search.
+def watch_site_for_keywords(site: str, keywords: List[str]) -> List[Dict[str, str]]:
+    """
+    Use OpenAI's web search to perform a watch task on an entire website for a list of keywords.
+
+    For the given `site` (e.g. 'https://example.com'), this function instructs OpenAI to search
+    for all pages or articles published in the last 48 hours that relate to any of the provided
+    keywords. The assistant is expected to return a JSON array of objects where each object has
+    the following keys:
+
+      - "Source": the name or title of the publication or source
+      - "Contexte et Résumé de la publication": a concise French summary of the content
+      - "Date de Publication": the publication date of the content (ISO or human readable)
+      - "Implications et Impacts sur UM6P": analysis of how the content affects UM6P
+      - "Recommandations Stratégiques pour UM6P": actionable recommendations for UM6P
+      - "Lien": the URL of the original content
+
+    Returns an empty list if no results or if parsing fails.
+    """
+    if not keywords:
+        return []
+    keywords_str = ", ".join(keywords)
+    # Construct prompt instructing the model to perform a comprehensive site search.
+    prompt = (
+        "Vous êtes un assistant de veille stratégique. "
+        "Sur le site suivant: {site}, recherchez toutes les publications des dernières 48 heures "
+        "qui traitent des mots-clés suivants: {keywords}. "
+        "Pour chaque publication trouvée, renvoyez un tableau JSON (array) d'objets avec les champs suivants: "
+        "\"Source\", \"Contexte et Résumé de la publication\", \"Date de Publication\", "
+        "\"Implications et Impacts sur UM6P\", \"Recommandations Stratégiques pour UM6P\", \"Lien\". "
+        "Incluez uniquement les publications publiées au cours des dernières 48 heures. "
+        "Le résultat doit être STRICTEMENT du JSON sans aucun texte supplémentaire avant ou après."
+    ).format(site=site, keywords=keywords_str)
+    result = call_openai_with_search(prompt=prompt, search_context_size="high")
+    text = result.get("text", "")
+    if not text:
+        return []
+    # Attempt to parse JSON array from the model output
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            parsed_items: List[Dict[str, str]] = []
+            for item in data:
+                if isinstance(item, dict):
+                    parsed_items.append(item)
+            return parsed_items
+    except Exception:
+        pass
+    # Fallback: extract the first JSON array in the output if extra text is present
+    try:
+        match = re.search(r"\[\s*\{.*\}\s*\]", text, re.S)
+        if match:
+            data = json.loads(match.group(0))
+            if isinstance(data, list):
+                parsed_items: List[Dict[str, str]] = []
+                for item in data:
+                    if isinstance(item, dict):
+                        parsed_items.append(item)
+                return parsed_items
+    except Exception:
+        pass
+    return []
 
 
 # ---------------------------------------------------------------------------
-# Pydantic models
+# Pydantic models for request validation
 
 class SourceConfig(BaseModel):
     keywords: List[str] = []
@@ -540,9 +596,9 @@ class UpdateRecipientsRequest(BaseModel):
 async def perform_watch_task() -> None:
     """
     Main watch task. Processes the configured keywords and URLs, fetches and
-    summarizes new content, updates the memory, and sends email reports.
+    summarises new content, updates the memory, and sends email reports.
 
-    Uses a simple file lock to prevent concurrent execution.
+    A file lock is used to prevent concurrent executions.
     """
     # Acquire lock
     try:
@@ -576,97 +632,73 @@ async def perform_watch_task() -> None:
         seen_urls_set: Set[str] = set(memory.get("seen_urls", []))
         new_urls: Set[str] = set()
         new_details: Dict[str, Any] = {}
-        findings: List[Dict[str, Any]] = []
-        # Process keywords × URLs
-        for keyword in keywords:
-            if not keyword:
+        all_results: List[Dict[str, Any]] = []
+        # Watch each site for the list of keywords using OpenAI
+        for site in urls_to_watch:
+            if not site:
                 continue
-            for base_url in urls_to_watch:
-                # # Perform external search for latest results
-                # search_results = perform_search(keyword, base_url)
-                # for res in search_results:
-                #     link = normalize_url(res["url"])
-                #     if not link or link in seen_urls_set:
-                #         continue
-                #     # Fetch page text
-                #     title, text = fetch_url_text(link)
-                #     if not text:
-                #         continue
-                #     # Check if keyword appears in text (basic filter)
-                #     if keyword.lower() not in text.lower():
-                #         continue
-                #     # Summarize
-                #     summary = summarize_with_url_context(link, text)
-                #     if not summary:
-                #         continue
-                #     findings.append(
-                #         {
-                #             "keyword": keyword,
-                #             "url": link,
-                #             "title": title or res.get("title") or "Sans titre",
-                #             "summary": summary,
-                #             "source": "search",
-                #             "signal": "search",
-                #         }
-                #     )
-                # # Directly analyse base URL if not already processed
-                if base_url and base_url not in seen_urls_set:
-                    title, text = fetch_url_text(base_url)
-                    if text and keyword.lower() in text.lower():
-                        summary = summarize_with_url_context(base_url, text)
-                        findings.append(
-                            {
-                                "keyword": keyword,
-                                "url": base_url,
-                                "title": title or "Sans titre",
-                                "summary": summary,
-                                "source": "direct_url",
-                                "signal": "direct_url",
-                            }
-                        )
-        # Filter out duplicates and seen URLs
-        unique_findings: List[Dict[str, Any]] = []
-        for item in findings:
-            url = item["url"]
-            if url not in seen_urls_set:
-                unique_findings.append(item)
-                new_urls.add(url)
-                new_details[url] = {
-                    "title": item["title"],
-                    "summary": item["summary"],
-                    "matched_keywords": [item["keyword"]],
-                    "source": item["source"],
-                    "signal": item["signal"],
-                }
-                seen_urls_set.add(url)
+            try:
+                site_results = watch_site_for_keywords(site, keywords)
+            except Exception as e:
+                logger.error(f"Error watching site {site}: {e}")
+                site_results = []
+            for entry in site_results:
+                # Extract and normalize the URL of the publication
+                link = normalize_url(str(entry.get("Lien", "")))
+                if not link:
+                    continue
+                if link in seen_urls_set:
+                    continue
+                # Mark as seen and accumulate
+                seen_urls_set.add(link)
+                new_urls.add(link)
+                new_details[link] = entry
+                all_results.append(entry)
         # Build report
         report_text = ""
-        if unique_findings:
-            # Group by keyword
-            keyword_to_items: Dict[str, List[Dict[str, Any]]] = {}
-            for item in unique_findings:
-                kw = item["keyword"]
-                keyword_to_items.setdefault(kw, []).append(item)
-            lines = ["# Rapport de veille par thématique\n"]
-            for kw, items in keyword_to_items.items():
-                lines.append(f"\n## Thématique: {kw}\n")
-                for it in items:
-                    t = it.get("title") or "Sans titre"
-                    u = it.get("url")
-                    s = it.get("summary") or "Pas de résumé disponible"
-                    src = it.get("source")
-                    sig = it.get("signal")
-                    lines.append(
-                        f"- {t}\n  {u}\n  Source: {src}\n  Signal: {sig}\n  {s}\n"
-                    )
+        if all_results:
+            # Compose prompt asking the model to create a concise Markdown table and summary
+            try:
+                json_results = json.dumps(all_results, ensure_ascii=False)
+            except Exception:
+                json_results = str(all_results)
             report_prompt = (
-                "Rédige un rapport synthétique (en français) sur les actualités suivantes, "
-                "organisé par thématique. Pour chaque thématique, résume les points clés "
-                "et termine par une synthèse globale avec 2-3 recommandations actionnables.\n\n"
-                + "\n".join(lines)
+                "Vous êtes un assistant de veille stratégique. "
+                "À partir de la liste JSON suivante d'actualités, génère un rapport structuré "
+                "sous forme de tableau Markdown. Le tableau doit avoir les colonnes suivantes : "
+                "Source, Contexte et Résumé de la publication, Date de Publication, "
+                "Implications et Impacts sur UM6P, Recommandations Stratégiques pour UM6P, Lien. "
+                "Chaque ligne du tableau doit synthétiser l'entrée correspondante avec des phrases courtes "
+                "et éviter les longues descriptions. "
+                "Après le tableau, ajoute un court paragraphe de synthèse générale (2-3 phrases) "
+                "et 2-3 recommandations actionnables pour UM6P. "
+                "Voici la liste JSON:\n\n"
+                f"{json_results}"
             )
-            generated_report = call_gemini_with_retry(prompt=report_prompt)
-            report_text = generated_report or "\n".join(lines)
+            result = call_openai_with_search(prompt=report_prompt, search_context_size="high")
+            report_text = result.get("text", "")
+            if not report_text:
+                # Build fallback table manually
+                headers = [
+                    "Source",
+                    "Contexte et Résumé de la publication",
+                    "Date de Publication",
+                    "Implications et Impacts sur UM6P",
+                    "Recommandations Stratégiques pour UM6P",
+                    "Lien",
+                ]
+                lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
+                for entry in all_results:
+                    row = [
+                        str(entry.get("Source", "")) or "",
+                        str(entry.get("Contexte et Résumé de la publication", "")) or "",
+                        str(entry.get("Date de Publication", "")) or "",
+                        str(entry.get("Implications et Impacts sur UM6P", "")) or "",
+                        str(entry.get("Recommandations Stratégiques pour UM6P", "")) or "",
+                        str(entry.get("Lien", "")) or "",
+                    ]
+                    lines.append(" | ".join(row))
+                report_text = "\n".join(lines)
         # Persist memory and send report
         if new_urls:
             memory["seen_urls"] = list(seen_urls_set)
@@ -750,8 +782,8 @@ def send_report_via_email(subject: str, body: str) -> None:
 app = FastAPI(
     title="Watcher API v3",
     description=(
-        "API de veille stratégique améliorée avec scraping, recherche externe facultative "
-        "et contexte URL pour Gemini. La mémoire est bornée et la concurrence contrôlée."
+        "API de veille stratégique avec scraping, recherche web via OpenAI et contexte URL. "
+        "La mémoire est bornée et la concurrence contrôlée."
     ),
 )
 
