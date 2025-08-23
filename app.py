@@ -1068,10 +1068,9 @@ def convert_report_to_html(report_text: str) -> str:
 # FastAPI app
 
 app = FastAPI(
-    title="Watcher API v3",
+    title="Watcher API",
     description=(
-        "API de veille stratégique avec scraping, recherche web via OpenAI et contexte URL. "
-        "La mémoire est bornée et la concurrence contrôlée."
+        "API de veille stratégique pour Surveiller et analyser les tendances : politiques publiques, innovation, recherche, durabilité "
     ),
 )
 
