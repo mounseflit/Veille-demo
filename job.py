@@ -7,7 +7,7 @@ def ping_backend():
     
     try:
         print(f"{datetime.datetime.now()}: Pinging {url}")
-        response = requests.get(url, timeout=30)
+        response = requests.post(url, timeout=30)
         print(f"Response: {response.status_code}")
         
         if response.status_code == 200:
